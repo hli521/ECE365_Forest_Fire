@@ -155,6 +155,7 @@ void loop() {
         }
         if (airReadingValid) {
             display.drawString(0, 44, "PM2.5: " + String(airData.pm25_env) + " ug/m3");
+            display.drawString(0, 56, "PM10: " + String(airData.pm100_env) + " ug/m3");
         } else {
             display.drawString(0, 44, "PMSA003I: no reading");
         }
