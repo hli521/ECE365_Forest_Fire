@@ -11,6 +11,7 @@ GridEYE gridEye;
 TwoWire gridEyeWire(1);
 constexpr int GRID_EYE_SDA = 41;
 constexpr int GRID_EYE_SCL = 42;
+constexpr uint32_t SENSOR_I2C_HZ = 100000;
 bool gridEyeConnected = false;
 Adafruit_PM25AQI airQuality;
 bool airQualityConnected = false;
@@ -18,6 +19,7 @@ PM25_AQI_Data airData;
 bool airReadingValid = false;
 unsigned long lastAirRead = 0;
 unsigned long lastAddressScan = 0;
+unsigned long lastGridStatus = 0;
 // Enable only when the full thermal image is needed; keep scans easy to read.
 constexpr bool PRINT_GRID_PIXELS = false;
 
@@ -59,7 +61,10 @@ void setup() {
 
     // The OLED uses Wire on GPIO17/18. Use the second I2C controller
     // for both external sensors wired to GPIO41/42.
-    gridEyeWire.begin(GRID_EYE_SDA, GRID_EYE_SCL, 400000);
+    // Use a slower clock while diagnosing unreliable measurement reads.
+    if (!gridEyeWire.begin(GRID_EYE_SDA, GRID_EYE_SCL, SENSOR_I2C_HZ)) {
+        Serial.println("ERROR: sensor I2C bus initialization failed");
+    }
 
     // Allow the PMSA003I to boot before probing the shared sensor bus.
     delay(3000);
@@ -82,6 +87,9 @@ void setup() {
     Serial.printf("Grid-EYE %s at 0x%02X\n", gridEyeConnected ? "found" : "NOT found", gridEyeAddr);
 
     airQualityConnected = airQuality.begin_I2C(&gridEyeWire);
+    gridEyeWire.setClock(SENSOR_I2C_HZ);
+    Serial.printf("Sensor I2C clock: %lu Hz\n",
+                  static_cast<unsigned long>(gridEyeWire.getClock()));
     Serial.printf("PMSA003I %s at 0x12\n", airQualityConnected ? "found" : "NOT found");
 
     display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -116,6 +124,11 @@ void loop() {
             goodReads++;
         }
         if (PRINT_GRID_PIXELS) Serial.println("---");
+        if (millis() - lastGridStatus >= 1000) {
+            lastGridStatus = millis();
+            Serial.printf("Grid-EYE: %d/64 pixel reads succeeded, %d failed\n",
+                          goodReads, 64 - goodReads);
+        }
 
         if (goodReads == 0) {
             display.drawString(0, 16, "Read error (-99)");
@@ -147,6 +160,10 @@ void loop() {
         }
     } else {
         display.drawString(0, 44, "PMSA003I not found");
+        if (millis() - lastAirRead >= 1000) {
+            lastAirRead = millis();
+            Serial.println("PMSA003I: startup initialization failed; reset board to retry");
+        }
     }
 
     display.display();
