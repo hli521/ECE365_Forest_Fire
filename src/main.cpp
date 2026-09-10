@@ -7,25 +7,26 @@
 // Grid-EYE default I2C address is 0x69 (jumper open).
 // Solder the ADDR jumper closed on the breakout to switch it to 0x68.
 GridEYE gridEye;
+TwoWire gridEyeWire(1);
+constexpr int GRID_EYE_SDA = 41;
+constexpr int GRID_EYE_SCL = 42;
 bool gridEyeConnected = false;
 
 // Probe an address with a plain I2C transaction (no register access) to see
 // if anything acks -- the GridEYE library's begin() never checks this.
 bool i2cPing(uint8_t addr) {
-    Wire.beginTransmission(addr);
-    return Wire.endTransmission() == 0;
+    gridEyeWire.beginTransmission(addr);
+    return gridEyeWire.endTransmission() == 0;
 }
 
 void setup() {
     heltec_setup();
 
-    // The OLED init above already brings up the shared I2C bus on
-    // SDA_OLED/SCL_OLED (GPIO17/18) at 700kHz. The AMG8833 is only rated
-    // for Fast-mode I2C (400kHz max), so back the clock off before talking
-    // to it -- the OLED is fine at 400kHz too.
-    Wire.setClock(400000);
+    // The OLED uses Wire on GPIO17/18. Use the second I2C controller
+    // for the Grid-EYE wired to GPIO41/42.
+    gridEyeWire.begin(GRID_EYE_SDA, GRID_EYE_SCL, 400000);
 
-    Serial.println("Scanning I2C bus...");
+    Serial.println("Scanning Grid-EYE I2C bus (SDA=41, SCL=42)...");
     for (uint8_t addr = 1; addr < 127; addr++) {
         if (i2cPing(addr)) {
             Serial.printf("  Found device at 0x%02X\n", addr);
@@ -45,7 +46,7 @@ void setup() {
         gridEyeConnected = false;
     }
 
-    gridEye.begin(gridEyeAddr);
+    gridEye.begin(gridEyeAddr, gridEyeWire);
     Serial.printf("Grid-EYE %s at 0x%02X\n", gridEyeConnected ? "found" : "NOT found", gridEyeAddr);
 
     display.setTextAlignment(TEXT_ALIGN_LEFT);
