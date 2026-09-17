@@ -1,3 +1,7 @@
+// build:
+// open new platformIO terminal
+//pio run -e heltec_wifi_lora_32_V3 -t upload --upload-port /dev/cu.usbserial-XXXX
+
 #include <Arduino.h>
 
 #define HELTEC_POWER_BUTTON
@@ -6,6 +10,7 @@
 #include <Adafruit_PM25AQI.h>
 #include <DHT.h>              // Adafruit DHT sensor library
 #include <Adafruit_Sensor.h>  // Adafruit Unified Sensor (DHT library dependency)
+#include <stdint.h>
 
 // Grid-EYE default I2C address is 0x69 (jumper open).
 // Solder the ADDR jumper closed on the breakout to switch it to 0x68.
@@ -32,6 +37,91 @@ unsigned long lastDhtRead = 0;
 float dhtTempC = NAN;
 float dhtHumidity = NAN;
 bool dhtReadingValid = false;
+
+// Both Heltec LoRa V3 boards must use these same radio settings. Choose a
+// frequency allowed in the deployment region (915 MHz is for the US).
+constexpr float LORA_FREQUENCY_MHZ = 915.0f;
+constexpr unsigned long LORA_SEND_INTERVAL_MS = 2000;
+constexpr int16_t INVALID_TEMPERATURE = INT16_MIN;
+constexpr size_t PACKET_SIZE = 4 + 4 + 1 + 64 * 2 + 3 * 2 + 2 * 2;
+uint8_t packet[PACKET_SIZE];
+int16_t gridPixels[64];
+bool gridReadingValid = false;
+bool radioReady = false;
+uint32_t packetSequence = 0;
+unsigned long lastLoraSend = 0;
+unsigned long txStarted = 0;
+unsigned long txTimeoutMs = 0;
+bool txInProgress = false;
+bool lastTxSucceeded = false;
+
+// FFS1 packet, little endian: magic[4], sequence[4], validity flags[1]
+// (bit 0 Grid-EYE, bit 1 PMSA003I, bit 2 DHT11), 64 pixel temperatures
+// in 0.1 C (INT16_MIN for a failed pixel), PM1/PM2.5/PM10 environmental
+// values in ug/m3 [3 x uint16], DHT temperature in 0.1 C and relative
+// humidity in 0.1 percent [2 x int16]. Invalid sensor fields are zero.
+void putU16(size_t &offset, uint16_t value) {
+  packet[offset++] = static_cast<uint8_t>(value);
+  packet[offset++] = static_cast<uint8_t>(value >> 8);
+}
+
+void putU32(size_t &offset, uint32_t value) {
+  putU16(offset, static_cast<uint16_t>(value));
+  putU16(offset, static_cast<uint16_t>(value >> 16));
+}
+
+int16_t toTenths(float value) {
+  return static_cast<int16_t>(lroundf(value * 10.0f));
+}
+
+void sendSensorPacket() {
+  if (!radioReady || txInProgress) return;
+
+  size_t offset = 0;
+  packet[offset++] = 'F';
+  packet[offset++] = 'F';
+  packet[offset++] = 'S';
+  packet[offset++] = '1';
+  putU32(offset, packetSequence++);
+  packet[offset++] = (gridReadingValid ? 1 : 0) |
+                     (airReadingValid ? 2 : 0) |
+                     (dhtReadingValid ? 4 : 0);
+  for (int16_t pixel : gridPixels) putU16(offset, static_cast<uint16_t>(pixel));
+  putU16(offset, airReadingValid ? airData.pm10_env : 0);
+  putU16(offset, airReadingValid ? airData.pm25_env : 0);
+  putU16(offset, airReadingValid ? airData.pm100_env : 0);
+  putU16(offset, dhtReadingValid ? static_cast<uint16_t>(toTenths(dhtTempC)) : 0);
+  putU16(offset, dhtReadingValid ? static_cast<uint16_t>(toTenths(dhtHumidity)) : 0);
+
+  // startTransmit returns while the radio sends the packet. Keep packet[]
+  // unchanged until finishTransmit so the OLED and sensors can keep updating.
+  int16_t result = radio.startTransmit(packet, offset);
+  txInProgress = result == RADIOLIB_ERR_NONE;
+  if (txInProgress) {
+    txStarted = millis();
+    txTimeoutMs = 5 + (radio.getTimeOnAir(offset) * 5) / 1000;
+  } else {
+    lastTxSucceeded = false;
+  }
+  Serial.printf("LoRa packet %lu (%u bytes): %s (%d)\n",
+                static_cast<unsigned long>(packetSequence - 1),
+                static_cast<unsigned>(offset),
+                txInProgress ? "transmitting" : "start failed", result);
+}
+
+void serviceLoraTransmit() {
+  if (!txInProgress) return;
+  bool done = digitalRead(DIO1) == HIGH;
+  bool timedOut = millis() - txStarted > txTimeoutMs;
+  if (!done && !timedOut) return;
+
+  int16_t result = radio.finishTransmit();
+  txInProgress = false;
+  lastTxSucceeded = done && result == RADIOLIB_ERR_NONE;
+  Serial.printf("LoRa packet %lu: %s (%d)\n",
+                static_cast<unsigned long>(packetSequence - 1),
+                lastTxSucceeded ? "sent" : "failed", result);
+}
 
 // Enable only when the full thermal image is needed; keep scans easy to read.
 constexpr bool PRINT_GRID_PIXELS = false;
@@ -71,6 +161,11 @@ void scanSensorAddresses() {
 
 void setup() {
   heltec_setup();
+  for (int16_t &pixel : gridPixels) pixel = INVALID_TEMPERATURE;
+  int16_t radioState = radio.begin(LORA_FREQUENCY_MHZ);
+  radioReady = radioState == RADIOLIB_ERR_NONE;
+  Serial.printf("LoRa at %.1f MHz: %s (%d)\n", LORA_FREQUENCY_MHZ,
+                radioReady ? "ready" : "initialization failed", radioState);
 
   // The OLED uses Wire on GPIO17/18. Use the second I2C controller
   // for both external sensors wired to GPIO41/42.
@@ -113,6 +208,7 @@ void setup() {
 }
 
 void loop() {
+  serviceLoraTransmit();
   if (millis() - lastAddressScan >= 10000) {
     scanSensorAddresses();
   }
@@ -127,6 +223,7 @@ void loop() {
     int goodReads = 0;
     for (int i = 0; i < 64; i++) {
       float t = gridEye.getPixelTemperature(i);
+      gridPixels[i] = t == -99.0f ? INVALID_TEMPERATURE : toTenths(t);
       if (PRINT_GRID_PIXELS) {
         Serial.print(t);
         Serial.print(i % 8 == 7 ? '\n' : '\t');
@@ -138,6 +235,7 @@ void loop() {
       sumTemp += t;
       goodReads++;
     }
+    gridReadingValid = goodReads > 0;
     if (PRINT_GRID_PIXELS) Serial.println("---");
     if (millis() - lastGridStatus >= 1000) {
       lastGridStatus = millis();
@@ -205,6 +303,15 @@ void loop() {
     display.drawString(0, 46, "DHT11: no reading");
   }
 
+  display.drawString(0, 56, !radioReady ? "LoRa init failed" :
+                     txInProgress ? "LoRa sending" :
+                     lastTxSucceeded ? "LoRa sent" : "LoRa waiting");
+
   display.display();
-  delay(250);
+  if (millis() - lastLoraSend >= LORA_SEND_INTERVAL_MS) {
+    lastLoraSend = millis();
+    sendSensorPacket();
+  }
+  serviceLoraTransmit();
+  delay(100);
 }
