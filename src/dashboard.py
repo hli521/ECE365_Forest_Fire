@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-Local sensor dashboard.
+Local LoRa sensor dashboard.
 
-Reads the "JSON:{...}" lines printed by the ESP32 (see server.cpp) over the
-same USB-serial connection you use for flashing/monitoring, and serves a
+Parses the normal human-readable lines the ESP32 already prints over USB
+Serial (the same output you see in `pio device monitor` - "Packet N...",
+the Grid-EYE grid, "PMSA003I: ..." and "DHT11: ...") and serves a
 live-updating dashboard at http://localhost:8000 - viewable only on this
-computer. No WiFi on the board needed.
+computer. No WiFi on the board needed, and no special JSON output required
+from the firmware.
 
 Setup:
     pip install pyserial
 
 Run:
-    python3 src/dashboard.py /dev/cu.usbserial-YYYY
+    python3 dashboard.py /dev/cu.usbserial-YYYY
     (Windows: python dashboard.py COM5)
 
 Then open http://localhost:8000 in your browser.
 """
 
+import re
 import sys
 import json
 import threading
@@ -37,9 +40,120 @@ state_lock = threading.Lock()
 latest = {"hasData": False}
 last_update_monotonic = None
 
+# ---- Line formats printed by server.cpp (see the loop() function) ----
+PACKET_RE = re.compile(r"^Packet (\d+), RSSI (-?\d+\.?\d*) dBm, SNR (-?\d+\.?\d*) dB$")
+GRID_STATUS_RE = re.compile(r"^Grid-EYE: (valid|unavailable)$")
+PM_VALID_RE = re.compile(
+    r"^PMSA003I:\s*PM1=(\d+(?:\.\d+)?)\s*PM2\.5=(\d+(?:\.\d+)?)\s*PM10=(\d+(?:\.\d+)?)\s*ug/m3\s*$",
+    re.IGNORECASE,
+)
+PM_INVALID_RE = re.compile(r"^PMSA003I:\s*unavailable\s*$", re.IGNORECASE)
+DHT_VALID_RE = re.compile(r"^DHT11: (-?\d+\.?\d*) C, (-?\d+\.?\d*) % RH$")
+DHT_INVALID_RE = re.compile(r"^DHT11: unavailable$")
+
+
+def _is_number(token: str) -> bool:
+    try:
+        float(token)
+        return True
+    except ValueError:
+        return False
+
+
+def _new_packet_ctx():
+    return {
+        "sequence": None, "rssi": None, "snr": None,
+        "gridEyeValid": None, "gridRows": [],
+    }
+
+
+def _finalize(ctx):
+    """Called once DHT11 line (always the last line of a packet) arrives."""
+    global latest, last_update_monotonic
+    if ctx["sequence"] is None:
+        return  # incomplete packet (e.g. we started listening mid-stream)
+
+    grid_flat = [v for row in ctx["gridRows"] for v in row]
+    while len(grid_flat) < 64:
+        grid_flat.append(None)
+
+    data = {
+        "hasData": True,
+        "sequence": ctx["sequence"],
+        "rssi": ctx["rssi"],
+        "snr": ctx["snr"],
+        "gridEyeValid": bool(ctx.get("gridEyeValid")),
+        "gridEye": grid_flat[:64],
+        "pmValid": bool(ctx.get("pmValid")),
+        "pm1": ctx.get("pm1", 0),
+        "pm25": ctx.get("pm25", 0),
+        "pm10": ctx.get("pm10", 0),
+        "dhtValid": bool(ctx.get("dhtValid")),
+        "temperature": ctx.get("temperature", 0.0),
+        "humidity": ctx.get("humidity", 0.0),
+    }
+    with state_lock:
+        latest = data
+        last_update_monotonic = time.monotonic()
+
+
+def _process_line(line: str, ctx: dict) -> dict:
+    """Feed one line into the parser state machine; returns the (possibly
+    new) context to keep passing in on the next call."""
+    m = PACKET_RE.match(line)
+    if m:
+        ctx = _new_packet_ctx()
+        ctx["sequence"] = int(m.group(1))
+        ctx["rssi"] = float(m.group(2))
+        ctx["snr"] = float(m.group(3))
+        return ctx
+
+    m = GRID_STATUS_RE.match(line)
+    if m:
+        ctx["gridEyeValid"] = (m.group(1) == "valid")
+        ctx["gridRows"] = []
+        return ctx
+
+    # The 8 pixel rows: tab-separated, always 8 tokens, each "ERR" or a number.
+    tokens = line.split("\t")
+    if (ctx["gridEyeValid"] is not None and len(ctx["gridRows"]) < 8
+            and len(tokens) == 8
+            and all(t == "ERR" or _is_number(t) for t in tokens)):
+        ctx["gridRows"].append([None if t == "ERR" else float(t) for t in tokens])
+        return ctx
+
+    m = PM_VALID_RE.match(line)
+    if m:
+        ctx["pmValid"] = True
+        ctx["pm1"] = int(float(m.group(1)))
+        ctx["pm25"] = int(float(m.group(2)))
+        ctx["pm10"] = int(float(m.group(3)))
+        return ctx
+    if PM_INVALID_RE.match(line):
+        ctx["pmValid"] = False
+        return ctx
+    if line.startswith("PMSA003I"):
+        # Didn't match either pattern - print exactly what we got (with any
+        # hidden/odd characters visible via repr) so the regex can be fixed.
+        print(f"DEBUG: unrecognized PMSA003I line: {line!r}")
+        return ctx
+
+    m = DHT_VALID_RE.match(line)
+    if m:
+        ctx["dhtValid"] = True
+        ctx["temperature"], ctx["humidity"] = float(m.group(1)), float(m.group(2))
+        _finalize(ctx)
+        return _new_packet_ctx()
+    if DHT_INVALID_RE.match(line):
+        ctx["dhtValid"] = False
+        _finalize(ctx)
+        return _new_packet_ctx()
+
+    return ctx  # unrecognized line (blank line, boot message, DEBUG:, etc.) - ignore
+
 
 def serial_reader(port: str):
-    global latest, last_update_monotonic
+    ctx = _new_packet_ctx()
     while True:
         try:
             with serial.Serial(port, BAUD_RATE, timeout=1) as ser:
@@ -52,17 +166,9 @@ def serial_reader(port: str):
                         line = raw.decode("utf-8", errors="ignore").strip()
                     except Exception:
                         continue
-                    if not line.startswith("JSON:"):
-                        continue  # ignore the human-readable debug prints
-                    payload = line[len("JSON:"):]
-                    try:
-                        data = json.loads(payload)
-                    except json.JSONDecodeError:
+                    if not line:
                         continue
-                    with state_lock:
-                        latest = data
-                        latest["hasData"] = True
-                        last_update_monotonic = time.monotonic()
+                    ctx = _process_line(line, ctx)
         except serial.SerialException as e:
             print(f"Serial error ({e}); retrying in 2s...")
             time.sleep(2)
@@ -76,16 +182,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <title>LoRa Sensor Dashboard</title>
 <style>
   :root { color-scheme: dark; }
-  body { background:#0f1115; color:#e6e6e6; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:20px; }
-  h1 { font-size:1.3rem; margin:0 0 4px; }
-  #status { color:#8a8f98; font-size:0.85rem; margin-bottom:20px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin-bottom:20px; }
-  .card { background:#1a1d24; border-radius:12px; padding:16px 18px; }
-  .card h2 { font-size:0.8rem; text-transform:uppercase; letter-spacing:0.05em; color:#8a8f98; margin:0 0 8px; }
-  .card .value { font-size:1.6rem; font-weight:600; }
-  .card .unit { font-size:0.9rem; color:#8a8f98; margin-left:4px; }
-  .unavailable { color:#555; font-style:italic; font-size:1.1rem; }
-  #thermalCanvas { width:100%; max-width:400px; aspect-ratio:1/1; border-radius:8px; image-rendering:pixelated; }
+  body { background:#0f1115; color:#e6e6e6; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:28px; }
+  h1 { font-size:1.6rem; margin:0 0 6px; }
+  #status { color:#8a8f98; font-size:1rem; margin-bottom:28px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:20px; margin-bottom:24px; }
+  .card { background:#1a1d24; border-radius:14px; padding:22px 26px; }
+  .card h2 { font-size:0.95rem; text-transform:uppercase; letter-spacing:0.06em; color:#9aa0aa; margin:0 0 12px; }
+  .card .value { font-size:3rem; font-weight:700; line-height:1.1; font-variant-numeric:tabular-nums; }
+  .card .unit { font-size:1.15rem; color:#9aa0aa; margin-left:6px; font-weight:500; }
+  .card .subline { font-size:1.05rem; color:#c2c6cf; margin-top:8px; }
+  .unavailable { color:#555; font-style:italic; font-size:1.3rem; }
+  #thermalCanvas { width:100%; max-width:440px; aspect-ratio:1/1; border-radius:10px; image-rendering:pixelated; }
   .offline { color:#e05656; }
 </style>
 </head>
@@ -97,21 +204,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <h2>Packet</h2>
       <div class="value" id="seq">&mdash;</div>
-      <div class="unit">RSSI <span id="rssi">&mdash;</span> dBm &middot; SNR <span id="snr">&mdash;</span> dB</div>
+      <div class="subline">RSSI <span id="rssi">&mdash;</span> dBm &middot; SNR <span id="snr">&mdash;</span> dB</div>
     </div>
     <div class="card">
-      <h2>PMSA003I</h2>
-      <div id="pmBlock">
-        <div class="value" id="pm25">&mdash;<span class="unit">&micro;g/m&sup3; PM2.5</span></div>
-        <div class="unit">PM1 <span id="pm1">&mdash;</span> &middot; PM10 <span id="pm10">&mdash;</span> &micro;g/m&sup3;</div>
+      <h2>PMSA003I &middot; PM2.5</h2>
+      <div id="pmReading">
+        <div class="value"><span id="pm25">&mdash;</span><span class="unit">&micro;g/m&sup3;</span></div>
+        <div class="subline">PM1 <span id="pm1">&mdash;</span> &middot; PM10 <span id="pm10">&mdash;</span> &micro;g/m&sup3;</div>
       </div>
+      <div class="unavailable" id="pmUnavailable" style="display:none;">unavailable</div>
     </div>
     <div class="card">
-      <h2>DHT11</h2>
-      <div id="dhtBlock">
-        <div class="value" id="temp">&mdash;<span class="unit">&deg;C</span></div>
-        <div class="unit">Humidity <span id="hum">&mdash;</span> %</div>
+      <h2>DHT11 &middot; Temperature</h2>
+      <div id="tempReading">
+        <div class="value"><span id="temp">&mdash;</span><span class="unit">&deg;C</span></div>
       </div>
+      <div class="unavailable" id="tempUnavailable" style="display:none;">unavailable</div>
+    </div>
+    <div class="card">
+      <h2>DHT11 &middot; Humidity</h2>
+      <div id="humReading">
+        <div class="value"><span id="hum">&mdash;</span><span class="unit">%</span></div>
+      </div>
+      <div class="unavailable" id="humUnavailable" style="display:none;">unavailable</div>
     </div>
   </div>
 
@@ -167,19 +282,23 @@ async function refresh() {
       document.getElementById('gridBlock').innerHTML = '<div class="unavailable">unavailable</div>';
     }
 
-    if (d.hasData && d.pmValid) {
-      document.getElementById('pm25').innerHTML = d.pm25 + '<span class="unit">µg/m³ PM2.5</span>';
+    const pmOk = d.hasData && d.pmValid;
+    document.getElementById('pmReading').style.display = pmOk ? '' : 'none';
+    document.getElementById('pmUnavailable').style.display = pmOk ? 'none' : '';
+    if (pmOk) {
+      document.getElementById('pm25').textContent = d.pm25;
       document.getElementById('pm1').textContent = d.pm1;
       document.getElementById('pm10').textContent = d.pm10;
-    } else {
-      document.getElementById('pmBlock').innerHTML = '<div class="unavailable">unavailable</div>';
     }
 
-    if (d.hasData && d.dhtValid) {
-      document.getElementById('temp').innerHTML = d.temperature.toFixed(1) + '<span class="unit">°C</span>';
+    const dhtOk = d.hasData && d.dhtValid;
+    document.getElementById('tempReading').style.display = dhtOk ? '' : 'none';
+    document.getElementById('tempUnavailable').style.display = dhtOk ? 'none' : '';
+    document.getElementById('humReading').style.display = dhtOk ? '' : 'none';
+    document.getElementById('humUnavailable').style.display = dhtOk ? 'none' : '';
+    if (dhtOk) {
+      document.getElementById('temp').textContent = d.temperature.toFixed(1);
       document.getElementById('hum').textContent = d.humidity.toFixed(1);
-    } else {
-      document.getElementById('dhtBlock').innerHTML = '<div class="unavailable">unavailable</div>';
     }
   } catch (e) {
     document.getElementById('status').textContent = 'Dashboard server not reachable';
