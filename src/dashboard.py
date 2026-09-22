@@ -11,7 +11,7 @@ Setup:
     pip install pyserial
 
 Run:
-    python3 dashboard.py /dev/cu.usbserial-YYYY
+    python3 src/dashboard.py /dev/cu.usbserial-YYYY
     (Windows: python dashboard.py COM5)
 
 Then open http://localhost:8000 in your browser.

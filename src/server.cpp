@@ -32,31 +32,39 @@ uint32_t readU32(size_t &offset) {
 void printJsonLine(uint32_t sequence, uint8_t valid, int16_t gridEye[64],
                     uint16_t pm1, uint16_t pm25, uint16_t pm10,
                     int16_t temperature, int16_t humidity) {
-  // One self-contained JSON object per line, prefixed so it's easy for the
-  // Python side to pick out among the human-readable debug prints.
-  Serial.print("JSON:{");
-  Serial.printf("\"sequence\":%lu,", static_cast<unsigned long>(sequence));
-  Serial.printf("\"rssi\":%.1f,", radio.getRSSI());
-  Serial.printf("\"snr\":%.1f,", radio.getSNR());
+  Serial.println("DEBUG: entered printJsonLine");
+
+  // Build the whole line in one String first, then send it with a single
+  // Serial call. Many small Serial.print()/printf() calls in a row were
+  // going missing on this board with no error - building it in memory and
+  // sending it as one write is more robust and also easier to size-check.
+  String json = "JSON:{";
+  json += "\"sequence\":" + String(sequence) + ",";
+  json += "\"rssi\":" + String(radio.getRSSI(), 1) + ",";
+  json += "\"snr\":" + String(radio.getSNR(), 1) + ",";
 
   bool gridValid = valid & 1;
-  Serial.printf("\"gridEyeValid\":%s,", gridValid ? "true" : "false");
-  Serial.print("\"gridEye\":[");
+  json += "\"gridEyeValid\":" + String(gridValid ? "true" : "false") + ",";
+  json += "\"gridEye\":[";
   for (int i = 0; i < 64; ++i) {
-    if (gridEye[i] == INT16_MIN) Serial.print("null");
-    else Serial.print(gridEye[i] / 10.0f, 1);
-    if (i < 63) Serial.print(",");
+    if (gridEye[i] == INT16_MIN) json += "null";
+    else json += String(gridEye[i] / 10.0f, 1);
+    if (i < 63) json += ",";
   }
-  Serial.print("],");
+  json += "],";
 
   bool pmValid = valid & 2;
-  Serial.printf("\"pmValid\":%s,", pmValid ? "true" : "false");
-  Serial.printf("\"pm1\":%u,\"pm25\":%u,\"pm10\":%u,", pm1, pm25, pm10);
+  json += "\"pmValid\":" + String(pmValid ? "true" : "false") + ",";
+  json += "\"pm1\":" + String(pm1) + ",\"pm25\":" + String(pm25) + ",\"pm10\":" + String(pm10) + ",";
 
   bool dhtValid = valid & 4;
-  Serial.printf("\"dhtValid\":%s,", dhtValid ? "true" : "false");
-  Serial.printf("\"temperature\":%.1f,\"humidity\":%.1f", temperature / 10.0f, humidity / 10.0f);
-  Serial.println("}");
+  json += "\"dhtValid\":" + String(dhtValid ? "true" : "false") + ",";
+  json += "\"temperature\":" + String(temperature / 10.0f, 1) + ",\"humidity\":" + String(humidity / 10.0f, 1);
+  json += "}";
+
+  Serial.printf("DEBUG: json length = %u bytes\n", static_cast<unsigned>(json.length()));
+  Serial.println(json);
+  Serial.println("DEBUG: leaving printJsonLine");
 }
 
 void setup() {
