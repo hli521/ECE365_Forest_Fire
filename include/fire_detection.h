@@ -12,7 +12,9 @@
 #pragma once
 
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 namespace fire {
 
@@ -126,6 +128,23 @@ inline const char *levelName(Level level) {
     case Level::Response: return "FIRE >80C";
   }
   return "?";
+}
+
+// Writes the crossed thresholds as text, e.g. "temp>50C, RH<50%", or "none".
+inline void describeReasons(uint8_t reasons, char *out, size_t size) {
+  if (size == 0) return;
+  out[0] = '\0';
+  auto add = [&](const char *text) {
+    if (out[0] != '\0') strncat(out, ", ", size - strlen(out) - 1);
+    strncat(out, text, size - strlen(out) - 1);
+  };
+  if (reasons & REASON_VERY_HOT) add("temp>80C");
+  else if (reasons & REASON_HOT) add("temp>50C");
+  if (reasons & REASON_SMOKE) add("PM2.5>150");
+  else if (reasons & REASON_HAZE) add("PM2.5>50");
+  if (reasons & REASON_DRY) add("RH<50%");
+  if (reasons & REASON_NO_DATA) add("no-sensor-data");
+  if (out[0] == '\0') add("none");
 }
 
 }  // namespace fire

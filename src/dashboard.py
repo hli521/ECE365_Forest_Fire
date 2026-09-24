@@ -50,6 +50,7 @@ PM_VALID_RE = re.compile(
 PM_INVALID_RE = re.compile(r"^PMSA003I:\s*unavailable\s*$", re.IGNORECASE)
 DHT_VALID_RE = re.compile(r"^DHT11: (-?\d+\.?\d*) C, (-?\d+\.?\d*) % RH$")
 DHT_INVALID_RE = re.compile(r"^DHT11: unavailable$")
+FIRE_RE = re.compile(r"^Fire: (NORMAL|SURVEILLANCE|FIRE|FIRE >80C) \(reasons: (.*)\)$")
 
 
 def _is_number(token: str) -> bool:
@@ -64,6 +65,7 @@ def _new_packet_ctx():
     return {
         "sequence": None, "rssi": None, "snr": None,
         "gridEyeValid": None, "gridRows": [],
+        "fireLevel": None, "fireReasons": None,
     }
 
 
@@ -91,6 +93,9 @@ def _finalize(ctx):
         "dhtValid": bool(ctx.get("dhtValid")),
         "temperature": ctx.get("temperature", 0.0),
         "humidity": ctx.get("humidity", 0.0),
+        # None when the server firmware predates fire detection.
+        "fireLevel": ctx.get("fireLevel"),
+        "fireReasons": ctx.get("fireReasons"),
     }
     with state_lock:
         latest = data
@@ -136,6 +141,11 @@ def _process_line(line: str, ctx: dict) -> dict:
         # Didn't match either pattern - print exactly what we got (with any
         # hidden/odd characters visible via repr) so the regex can be fixed.
         print(f"DEBUG: unrecognized PMSA003I line: {line!r}")
+        return ctx
+
+    m = FIRE_RE.match(line)
+    if m:
+        ctx["fireLevel"], ctx["fireReasons"] = m.group(1), m.group(2)
         return ctx
 
     m = DHT_VALID_RE.match(line)
@@ -194,11 +204,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .unavailable { color:#555; font-style:italic; font-size:1.3rem; }
   #thermalCanvas { width:100%; max-width:440px; aspect-ratio:1/1; border-radius:10px; image-rendering:pixelated; }
   .offline { color:#e05656; }
+  #fireBanner { margin-bottom:24px; border-left:8px solid #444; }
+  #fireBanner .value { font-size:2.4rem; }
+  #fireBanner.normal { border-left-color:#3fa76a; }
+  #fireBanner.normal .value { color:#5fd38d; }
+  #fireBanner.surveillance { border-left-color:#d9a21b; background:#2a2414; }
+  #fireBanner.surveillance .value { color:#f2c14e; }
+  #fireBanner.fire { border-left-color:#e05656; background:#3a1616; }
+  #fireBanner.fire .value { color:#ff7a7a; }
 </style>
 </head>
 <body>
   <h1>LoRa Sensor Dashboard (local)</h1>
   <div id="status">Waiting for first packet&hellip;</div>
+
+  <div class="card" id="fireBanner">
+    <h2>Fire status</h2>
+    <div class="value" id="fireLevel">&mdash;</div>
+    <div class="subline" id="fireDetail">Waiting for first packet</div>
+  </div>
 
   <div class="grid">
     <div class="card">
@@ -269,6 +293,25 @@ async function refresh() {
     document.getElementById('status').textContent =
       d.hasData ? `Last update: ${d.secondsAgo}s ago` : 'No packet received yet';
     document.getElementById('status').classList.toggle('offline', d.hasData && d.secondsAgo > 30);
+
+    const banner = document.getElementById('fireBanner');
+    banner.className = 'card';
+    if (d.hasData && d.fireLevel) {
+      const level = d.fireLevel;
+      banner.classList.add(level.startsWith('FIRE') ? 'fire' :
+                           level === 'SURVEILLANCE' ? 'surveillance' : 'normal');
+      document.getElementById('fireLevel').textContent =
+        level === 'NORMAL' ? 'No fire detected' :
+        level === 'SURVEILLANCE' ? 'Surveillance: fire risk' :
+        level === 'FIRE' ? 'FIRE DETECTED' : 'FIRE DETECTED (above 80 °C)';
+      document.getElementById('fireDetail').textContent =
+        `Level ${level} · thresholds crossed: ${d.fireReasons}`;
+    } else {
+      document.getElementById('fireLevel').textContent = '—';
+      document.getElementById('fireDetail').textContent = d.hasData
+        ? 'No fire status in packet (update device and server firmware)'
+        : 'Waiting for first packet';
+    }
 
     document.getElementById('seq').textContent = d.hasData ? d.sequence : '—';
     document.getElementById('rssi').textContent = d.hasData ? d.rssi.toFixed(1) : '—';

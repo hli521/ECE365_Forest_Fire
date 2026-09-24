@@ -45,13 +45,14 @@ unsigned long lastFireCheck = 0;
 float gridMaxTempC = NAN;
 fire::Detector fireDetector;
 fire::Level fireLevel = fire::Level::Normal;
+uint8_t fireReasons = 0;
 
 // Both Heltec LoRa V3 boards must use these same radio settings. Choose a
 // frequency allowed in the deployment region (915 MHz is for the US).
 constexpr float LORA_FREQUENCY_MHZ = 915.0f;
 constexpr unsigned long LORA_SEND_INTERVAL_MS = 2000;
 constexpr int16_t INVALID_TEMPERATURE = INT16_MIN;
-constexpr size_t PACKET_SIZE = 4 + 4 + 1 + 64 * 2 + 3 * 2 + 2 * 2;
+constexpr size_t PACKET_SIZE = 4 + 4 + 1 + 64 * 2 + 3 * 2 + 2 * 2 + 2;
 uint8_t packet[PACKET_SIZE];
 int16_t gridPixels[64];
 bool gridReadingValid = false;
@@ -63,11 +64,13 @@ unsigned long txTimeoutMs = 0;
 bool txInProgress = false;
 bool lastTxSucceeded = false;
 
-// FFS1 packet, little endian: magic[4], sequence[4], validity flags[1]
+// FFS2 packet, little endian: magic[4], sequence[4], validity flags[1]
 // (bit 0 Grid-EYE, bit 1 PMSA003I, bit 2 DHT11), 64 pixel temperatures
 // in 0.1 C (INT16_MIN for a failed pixel), PM1/PM2.5/PM10 environmental
 // values in ug/m3 [3 x uint16], DHT temperature in 0.1 C and relative
-// humidity in 0.1 percent [2 x int16]. Invalid sensor fields are zero.
+// humidity in 0.1 percent [2 x int16], confirmed fire::Level [1], and
+// fire::Reason bits from the latest assessment [1]. Invalid sensor fields
+// are zero.
 void putU16(size_t &offset, uint16_t value) {
   packet[offset++] = static_cast<uint8_t>(value);
   packet[offset++] = static_cast<uint8_t>(value >> 8);
@@ -89,7 +92,7 @@ void sendSensorPacket() {
   packet[offset++] = 'F';
   packet[offset++] = 'F';
   packet[offset++] = 'S';
-  packet[offset++] = '1';
+  packet[offset++] = '2';
   putU32(offset, packetSequence++);
   packet[offset++] = (gridReadingValid ? 1 : 0) |
                      (airReadingValid ? 2 : 0) |
@@ -100,6 +103,8 @@ void sendSensorPacket() {
   putU16(offset, airReadingValid ? airData.pm100_env : 0);
   putU16(offset, dhtReadingValid ? static_cast<uint16_t>(toTenths(dhtTempC)) : 0);
   putU16(offset, dhtReadingValid ? static_cast<uint16_t>(toTenths(dhtHumidity)) : 0);
+  packet[offset++] = static_cast<uint8_t>(fireLevel);
+  packet[offset++] = fireReasons;
 
   // startTransmit returns while the radio sends the packet. Keep packet[]
   // unchanged until finishTransmit so the OLED and sensors can keep updating.
@@ -131,16 +136,6 @@ void serviceLoraTransmit() {
                 lastTxSucceeded ? "sent" : "failed", result);
 }
 
-void printFireReasons(uint8_t reasons) {
-  if (reasons == 0) Serial.print(" none");
-  if (reasons & fire::REASON_VERY_HOT) Serial.print(" temp>80C");
-  else if (reasons & fire::REASON_HOT) Serial.print(" temp>50C");
-  if (reasons & fire::REASON_SMOKE) Serial.print(" PM2.5>150");
-  else if (reasons & fire::REASON_HAZE) Serial.print(" PM2.5>50");
-  if (reasons & fire::REASON_DRY) Serial.print(" RH<50%");
-  if (reasons & fire::REASON_NO_DATA) Serial.print(" no-sensor-data");
-}
-
 // Uses the hottest Grid-EYE pixel as well as the DHT11 air temperature: the
 // DHT11 only measures up to 50 C, so it cannot report the fire thresholds.
 void checkForFire() {
@@ -157,12 +152,13 @@ void checkForFire() {
   fire::Assessment assessment = fire::assess(readings);
   fire::Level previous = fireLevel;
   fireLevel = fireDetector.update(assessment.level);
+  fireReasons = assessment.reasons;
 
-  Serial.printf("Fire check: %s (current reading %s; max temp %.1f C, RH %.1f %%, PM2.5 %.0f ug/m3; reasons:",
+  char reasonText[64];
+  fire::describeReasons(assessment.reasons, reasonText, sizeof(reasonText));
+  Serial.printf("Fire check: %s (current reading %s; max temp %.1f C, RH %.1f %%, PM2.5 %.0f ug/m3; reasons: %s)\n",
                 fire::levelName(fireLevel), fire::levelName(assessment.level),
-                readings.maxTempC, readings.humidityPct, readings.pm25);
-  printFireReasons(assessment.reasons);
-  Serial.println(")");
+                readings.maxTempC, readings.humidityPct, readings.pm25, reasonText);
   if (fireLevel != previous) {
     Serial.printf("*** FIRE LEVEL CHANGED: %s -> %s ***\n",
                   fire::levelName(previous), fire::levelName(fireLevel));

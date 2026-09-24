@@ -124,7 +124,13 @@ The device board checks its readings against predefined thresholds once per seco
 | `FIRE` | A fire threshold crossed | LED blinking |
 | `FIRE >80C` | Automatic-response temperature crossed | LED blinking |
 
-The highest level reached by any sensor wins. A level is confirmed only after it appears in 3 consecutive checks (about 3 seconds), so a single bad reading does not raise an alarm. The confirmed level drops as soon as readings recover. The level is shown on the device OLED's bottom line and printed to the device's serial output as `Fire check: ...`. It is not yet included in the LoRa packet, so the server and dashboard do not show it.
+The highest level reached by any sensor wins. A level is confirmed only after it appears in 3 consecutive checks (about 3 seconds), so a single bad reading does not raise an alarm. The confirmed level drops as soon as readings recover. The confirmed level and the crossed thresholds are shown in these places:
+
+- Device: OLED bottom line, onboard LED, and serial output as `Fire check: ...` every second.
+- Server: sent in every LoRa packet, shown on the server OLED as `Fire: ...`, and printed to serial as `Fire: <LEVEL> (reasons: ...)`.
+- Dashboard: a colored **Fire status** banner at the top of the page.
+
+The server shows the level from the latest packet, so it can lag the device by up to one send interval (about 2 seconds).
 
 A sensor without a current valid reading is skipped. If no sensor has a valid reading, the level stays `NORMAL` and the serial line reports `no-sensor-data`.
 
@@ -154,7 +160,7 @@ Notes on the active sensors:
 2. Read it in `src/device.cpp` and keep a validity flag, like the existing sensors.
 3. Add its thresholds as constants and a field in `fire::Readings` in `include/fire_detection.h`, and evaluate them in `fire::assess()`. Add a `REASON_...` bit for it and print that bit in `printFireReasons()` in `src/device.cpp`.
 4. Pass the reading from `checkForFire()` in `src/device.cpp`, using `NAN` when the reading is invalid.
-5. To send the reading to the server, extend the packet format in both `src/device.cpp` and `src/server.cpp` and update `PACKET_SIZE` in both files.
+5. The fire level and reasons already reach the server and dashboard; new `REASON_...` bits need only a label in `fire::describeReasons()`. To send the raw reading too, extend the packet format in both `src/device.cpp` and `src/server.cpp`, update `PACKET_SIZE` in both files, and change the packet magic (currently `FFS2`) so old firmware ignores the new format.
 6. Update the table above from `Not connected` to `Connected, active`.
 
 ## Troubleshooting
@@ -168,6 +174,7 @@ Notes on the active sensors:
 | `PMSA003I read failed` | The startup initialization succeeded, but a measurement read failed. Check supply stability and I2C wiring/pull-ups; reads retry each second. |
 | `DHT11 read failed (NaN)` | Check DATA on GPIO4, sensor power/ground, the pull-up, and whether the actual sensor is DHT11 or DHT22. Initialization logs alone do not prove the sensor responds. |
 | Grid-EYE appears in a scan but remains “not found” | Its startup probe may have failed. Check connections and power, then reset the device. An address ACK alone does not prove reliable measurement reads. |
+| Server prints `Ignored packet: ... wrong protocol` | The two boards run firmware with different packet formats. Rebuild and upload both programs. |
 | Server reports sensor `unavailable` | A packet arrived, but the device marked that sensor's reading invalid. Inspect the device's serial output. |
 | Device reports packets sent but server receives none | Confirm both boards run their respective programs, use matching radio settings, have antennas attached, and are powered. A successful transmit log is not a receiver acknowledgement. |
 | `LoRa ... initialization failed` | Confirm the physical board is the configured Heltec WiFi LoRa 32 V3 and inspect the reported error code. |

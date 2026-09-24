@@ -11,10 +11,11 @@
 #include <Arduino.h>
 #include <heltec_unofficial.h>
 #include <stdint.h>
+#include "fire_detection.h"
 
 // Match the frequency and RadioLib defaults used by device.cpp.
 constexpr float LORA_FREQUENCY_MHZ = 915.0f;
-constexpr size_t PACKET_SIZE = 4 + 4 + 1 + 64 * 2 + 3 * 2 + 2 * 2;
+constexpr size_t PACKET_SIZE = 4 + 4 + 1 + 64 * 2 + 3 * 2 + 2 * 2 + 2;
 uint8_t packet[PACKET_SIZE];
 bool radioReady = false;
 
@@ -31,7 +32,8 @@ uint32_t readU32(size_t &offset) {
 
 void printJsonLine(uint32_t sequence, uint8_t valid, int16_t gridEye[64],
                     uint16_t pm1, uint16_t pm25, uint16_t pm10,
-                    int16_t temperature, int16_t humidity) {
+                    int16_t temperature, int16_t humidity,
+                    fire::Level fireLevel, const char *fireReasons) {
   Serial.println("DEBUG: entered printJsonLine");
 
   // Build the whole line in one String first, then send it with a single
@@ -59,7 +61,9 @@ void printJsonLine(uint32_t sequence, uint8_t valid, int16_t gridEye[64],
 
   bool dhtValid = valid & 4;
   json += "\"dhtValid\":" + String(dhtValid ? "true" : "false") + ",";
-  json += "\"temperature\":" + String(temperature / 10.0f, 1) + ",\"humidity\":" + String(humidity / 10.0f, 1);
+  json += "\"temperature\":" + String(temperature / 10.0f, 1) + ",\"humidity\":" + String(humidity / 10.0f, 1) + ",";
+  json += "\"fireLevel\":\"" + String(fire::levelName(fireLevel)) + "\",";
+  json += "\"fireReasons\":\"" + String(fireReasons) + "\"";
   json += "}";
 
   Serial.printf("DEBUG: json length = %u bytes\n", static_cast<unsigned>(json.length()));
@@ -89,7 +93,7 @@ void loop() {
     Serial.printf("LoRa receive error: %d\n", state);
     return;
   }
-  if (length != PACKET_SIZE || memcmp(packet, "FFS1", 4) != 0) {
+  if (length != PACKET_SIZE || memcmp(packet, "FFS2", 4) != 0) {
     Serial.printf("Ignored packet: %u bytes or wrong protocol\n",
                   static_cast<unsigned>(length));
     return;
@@ -114,15 +118,25 @@ void loop() {
   uint16_t pm10 = readU16(offset);
   int16_t temperature = static_cast<int16_t>(readU16(offset));
   int16_t humidity = static_cast<int16_t>(readU16(offset));
+  uint8_t rawFireLevel = packet[offset++];
+  uint8_t fireReasonBits = packet[offset++];
+  fire::Level fireLevel = rawFireLevel <= static_cast<uint8_t>(fire::Level::Response)
+                              ? static_cast<fire::Level>(rawFireLevel)
+                              : fire::Level::Normal;
+  char fireReasons[64];
+  fire::describeReasons(fireReasonBits, fireReasons, sizeof(fireReasons));
   if (valid & 2) {
     Serial.printf("PMSA003I: PM1=%u PM2.5=%u PM10=%u ug/m3\n", pm1, pm25, pm10);
   } else Serial.println("PMSA003I: unavailable");
+  // Keep the DHT11 line last: dashboard.py treats it as the end of a packet.
+  Serial.printf("Fire: %s (reasons: %s)\n", fire::levelName(fireLevel), fireReasons);
   if (valid & 4) {
     Serial.printf("DHT11: %.1f C, %.1f %% RH\n",
                   temperature / 10.0f, humidity / 10.0f);
   } else Serial.println("DHT11: unavailable");
 
-  printJsonLine(sequence, valid, gridEye, pm1, pm25, pm10, temperature, humidity);
+  printJsonLine(sequence, valid, gridEye, pm1, pm25, pm10, temperature, humidity,
+                fireLevel, fireReasons);
 
   display.clear();
   display.drawString(0, 0, "Packet " + String(sequence));
@@ -130,5 +144,6 @@ void loop() {
   display.drawString(0, 24, valid & 2 ? "PM2.5 " + String(pm25) + " ug/m3" : "PM unavailable");
   display.drawString(0, 36, valid & 4 ? "T " + String(temperature / 10.0f, 1) +
                                       "C H " + String(humidity / 10.0f, 1) + "%" : "DHT unavailable");
+  display.drawString(0, 48, "Fire: " + String(fire::levelName(fireLevel)));
   display.display();
 }
