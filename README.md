@@ -111,6 +111,52 @@ Both source files currently set `LORA_FREQUENCY_MHZ` to `915.0f`. Keep radio set
 
 When both boards are connected to the computer, identify their ports by connecting one at a time, then use the explicit port in every upload and monitor command. You can run one monitor per board in separate terminals. Recheck port names after reconnecting USB.
 
+## Fire detection
+
+The device board checks its readings against predefined thresholds once per second. The thresholds and logic are in `include/fire_detection.h`; `checkForFire()` in `src/device.cpp` feeds them the current readings.
+
+### Levels
+
+| Level | Meaning | Device output |
+| --- | --- | --- |
+| `NORMAL` | No threshold crossed | LED off |
+| `SURVEILLANCE` | Fire-risk conditions (dry air or elevated PM2.5) | LED dim |
+| `FIRE` | A fire threshold crossed | LED blinking |
+| `FIRE >80C` | Automatic-response temperature crossed | LED blinking |
+
+The highest level reached by any sensor wins. A level is confirmed only after it appears in 3 consecutive checks (about 3 seconds), so a single bad reading does not raise an alarm. The confirmed level drops as soon as readings recover. The level is shown on the device OLED's bottom line and printed to the device's serial output as `Fire check: ...`. It is not yet included in the LoRa packet, so the server and dashboard do not show it.
+
+A sensor without a current valid reading is skipped. If no sensor has a valid reading, the level stays `NORMAL` and the serial line reports `no-sensor-data`.
+
+### Thresholds and sensor status
+
+| Measurement | Sensor | Status | Normal | Surveillance | Fire |
+| --- | --- | --- | --- | --- | --- |
+| Temperature | Grid-EYE (hottest pixel) and DHT11 (air) | Connected, active | ≤ 50 °C | — | > 50 °C; automatic response > 80 °C |
+| Relative humidity | DHT11 | Connected, active | ≥ 50 % | < 50 % | — (dry air alone never means fire) |
+| PM2.5 | PMSA003I | Connected, active | ≤ 50 µg/m³ | > 50 to 150 µg/m³ | > 150 µg/m³ |
+| Flame | Flame sensor | Not connected | — | — | Reading below 100, or 760–1100 nm flame radiation detected |
+| CO₂ | Gas sensor | Not connected | — | — | Estimated CO₂ above 30 % |
+| Smoke (12-bit ADC, 0–4095) | Smoke sensor | Not connected | ≤ 1190 | > 1190 to 1984 | > 1984 |
+| VOCs | — | Not connected, no threshold | — | — | — |
+
+Thresholds come from a prior study ([8] in the project report). The study notes that VOCs can signal a fire before visible flames but are hard to detect outdoors because they dilute quickly, so no VOC threshold was defined.
+
+Notes on the active sensors:
+
+- The DHT11 measures only up to 50 °C, so it cannot report a fire temperature alone. The Grid-EYE's hottest pixel provides the fire temperature.
+- The Grid-EYE's hottest pixel is a surface temperature, not air temperature. Strongly sunlit surfaces can exceed 50 °C.
+- The standard Grid-EYE measures up to about 80 °C, so the > 80 °C level may not trigger unless the sensor is the high-gain model.
+
+### Adding a sensor that is not yet connected
+
+1. Wire it to the device board and add a row to the wiring table above.
+2. Read it in `src/device.cpp` and keep a validity flag, like the existing sensors.
+3. Add its thresholds as constants and a field in `fire::Readings` in `include/fire_detection.h`, and evaluate them in `fire::assess()`. Add a `REASON_...` bit for it and print that bit in `printFireReasons()` in `src/device.cpp`.
+4. Pass the reading from `checkForFire()` in `src/device.cpp`, using `NAN` when the reading is invalid.
+5. To send the reading to the server, extend the packet format in both `src/device.cpp` and `src/server.cpp` and update `PACKET_SIZE` in both files.
+6. Update the table above from `Not connected` to `Connected, active`.
+
 ## Troubleshooting
 
 | Symptom | What to check |

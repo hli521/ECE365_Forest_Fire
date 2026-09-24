@@ -11,6 +11,7 @@
 #include <DHT.h>              // Adafruit DHT sensor library
 #include <Adafruit_Sensor.h>  // Adafruit Unified Sensor (DHT library dependency)
 #include <stdint.h>
+#include "fire_detection.h"
 
 // Grid-EYE default I2C address is 0x69 (jumper open).
 // Solder the ADDR jumper closed on the breakout to switch it to 0x68.
@@ -37,6 +38,13 @@ unsigned long lastDhtRead = 0;
 float dhtTempC = NAN;
 float dhtHumidity = NAN;
 bool dhtReadingValid = false;
+
+// --- Fire detection (thresholds in include/fire_detection.h) ---
+constexpr unsigned long FIRE_CHECK_INTERVAL_MS = 1000;
+unsigned long lastFireCheck = 0;
+float gridMaxTempC = NAN;
+fire::Detector fireDetector;
+fire::Level fireLevel = fire::Level::Normal;
 
 // Both Heltec LoRa V3 boards must use these same radio settings. Choose a
 // frequency allowed in the deployment region (915 MHz is for the US).
@@ -121,6 +129,54 @@ void serviceLoraTransmit() {
   Serial.printf("LoRa packet %lu: %s (%d)\n",
                 static_cast<unsigned long>(packetSequence - 1),
                 lastTxSucceeded ? "sent" : "failed", result);
+}
+
+void printFireReasons(uint8_t reasons) {
+  if (reasons == 0) Serial.print(" none");
+  if (reasons & fire::REASON_VERY_HOT) Serial.print(" temp>80C");
+  else if (reasons & fire::REASON_HOT) Serial.print(" temp>50C");
+  if (reasons & fire::REASON_SMOKE) Serial.print(" PM2.5>150");
+  else if (reasons & fire::REASON_HAZE) Serial.print(" PM2.5>50");
+  if (reasons & fire::REASON_DRY) Serial.print(" RH<50%");
+  if (reasons & fire::REASON_NO_DATA) Serial.print(" no-sensor-data");
+}
+
+// Uses the hottest Grid-EYE pixel as well as the DHT11 air temperature: the
+// DHT11 only measures up to 50 C, so it cannot report the fire thresholds.
+void checkForFire() {
+  fire::Readings readings;
+  if (gridReadingValid) readings.maxTempC = gridMaxTempC;
+  if (dhtReadingValid) {
+    readings.humidityPct = dhtHumidity;
+    if (isnan(readings.maxTempC) || dhtTempC > readings.maxTempC) {
+      readings.maxTempC = dhtTempC;
+    }
+  }
+  if (airReadingValid) readings.pm25 = airData.pm25_env;
+
+  fire::Assessment assessment = fire::assess(readings);
+  fire::Level previous = fireLevel;
+  fireLevel = fireDetector.update(assessment.level);
+
+  Serial.printf("Fire check: %s (current reading %s; max temp %.1f C, RH %.1f %%, PM2.5 %.0f ug/m3; reasons:",
+                fire::levelName(fireLevel), fire::levelName(assessment.level),
+                readings.maxTempC, readings.humidityPct, readings.pm25);
+  printFireReasons(assessment.reasons);
+  Serial.println(")");
+  if (fireLevel != previous) {
+    Serial.printf("*** FIRE LEVEL CHANGED: %s -> %s ***\n",
+                  fire::levelName(previous), fire::levelName(fireLevel));
+  }
+}
+
+// Onboard LED: off when normal, dim when under surveillance,
+// blinking when a fire is confirmed.
+void updateFireLed() {
+  switch (fireLevel) {
+    case fire::Level::Normal: heltec_led(0); break;
+    case fire::Level::Surveillance: heltec_led(5); break;
+    default: heltec_led((millis() / 250) % 2 ? 100 : 0); break;
+  }
 }
 
 // Enable only when the full thermal image is needed; keep scans easy to read.
@@ -236,6 +292,7 @@ void loop() {
       goodReads++;
     }
     gridReadingValid = goodReads > 0;
+    gridMaxTempC = gridReadingValid ? maxTemp : NAN;
     if (PRINT_GRID_PIXELS) Serial.println("---");
     if (millis() - lastGridStatus >= 1000) {
       lastGridStatus = millis();
@@ -303,9 +360,16 @@ void loop() {
     display.drawString(0, 46, "DHT11: no reading");
   }
 
-  display.drawString(0, 56, !radioReady ? "LoRa init failed" :
-                     txInProgress ? "LoRa sending" :
-                     lastTxSucceeded ? "LoRa sent" : "LoRa waiting");
+  if (millis() - lastFireCheck >= FIRE_CHECK_INTERVAL_MS) {
+    lastFireCheck = millis();
+    checkForFire();
+  }
+  updateFireLed();
+
+  display.drawString(0, 56, String(fire::levelName(fireLevel)) + "  " +
+                     (!radioReady ? "LoRa err" :
+                      txInProgress ? "Tx..." :
+                      lastTxSucceeded ? "Tx ok" : "Tx wait"));
 
   display.display();
   if (millis() - lastLoraSend >= LORA_SEND_INTERVAL_MS) {
