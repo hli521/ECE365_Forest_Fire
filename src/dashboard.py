@@ -239,7 +239,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="unavailable" id="pmUnavailable" style="display:none;">unavailable</div>
     </div>
     <div class="card">
-      <h2>DHT11 &middot; Temperature</h2>
+      <h2>Temperature</h2>
       <div id="tempReading">
         <div class="value"><span id="temp">&mdash;</span><span class="unit">&deg;C</span></div>
       </div>
