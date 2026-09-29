@@ -1,7 +1,7 @@
 // Threshold-based fire detection for the device board.
 //
 // Only the thresholds for sensors on this board are applied: temperature
-// (Grid-EYE and DHT11), relative humidity (DHT11), and PM2.5 (PMSA003I).
+// (Grid-EYE), relative humidity (DHT11), and PM2.5 (PMSA003I).
 // The reference study's flame, CO2, smoke-ADC, and VOC thresholds need
 // sensors that are not connected yet. The README's "Fire detection" section
 // lists every threshold, its sensor, and how to add a sensor here.

@@ -136,16 +136,13 @@ void serviceLoraTransmit() {
                 lastTxSucceeded ? "sent" : "failed", result);
 }
 
-// Uses the hottest Grid-EYE pixel as well as the DHT11 air temperature: the
-// DHT11 only measures up to 50 C, so it cannot report the fire thresholds.
+// Uses only the hottest Grid-EYE pixel for temperature detection. The DHT11
+// contributes humidity, but its temperature reading is kept out of detection.
 void checkForFire() {
   fire::Readings readings;
   if (gridReadingValid) readings.maxTempC = gridMaxTempC;
   if (dhtReadingValid) {
     readings.humidityPct = dhtHumidity;
-    if (isnan(readings.maxTempC) || dhtTempC > readings.maxTempC) {
-      readings.maxTempC = dhtTempC;
-    }
   }
   if (airReadingValid) readings.pm25 = airData.pm25_env;
 
