@@ -120,11 +120,11 @@ The device board checks its readings against predefined thresholds once per seco
 | Level | Meaning | Device output |
 | --- | --- | --- |
 | `NORMAL` | No threshold crossed | LED off |
-| `SURVEILLANCE` | Fire-risk conditions (dry air or elevated PM2.5) | LED dim |
+| `SURVEILLANCE` | Fire-risk conditions: dry air and elevated PM2.5 together | LED dim |
 | `FIRE` | A fire threshold crossed | LED blinking |
 | `FIRE >80C` | Automatic-response temperature crossed | LED blinking |
 
-The highest level reached by any sensor wins. A level is confirmed only after it appears in 3 consecutive checks (about 3 seconds), so a single bad reading does not raise an alarm. The confirmed level drops as soon as readings recover. The confirmed level and the crossed thresholds are shown in these places:
+Fire thresholds use OR: any one sensor crossing its fire threshold raises `FIRE`, so a fire seen by only one sensor is not missed. Surveillance thresholds use AND: `SURVEILLANCE` is raised only when every risk sensor with a valid reading (currently humidity and PM2.5) crosses its surveillance threshold. Dry air alone, which is common indoors, or haze in humid air therefore stays `NORMAL`, although the crossed threshold is still listed in the reasons. If one of these sensors has no valid reading, the other one decides alone. The highest level reached wins. A level is confirmed only after it appears in 3 consecutive checks (about 3 seconds), so a single bad reading does not raise an alarm. The confirmed level drops as soon as readings recover. The confirmed level and the crossed thresholds are shown in these places:
 
 - Device: OLED bottom line, onboard LED, and serial output as `Fire check: ...` every second.
 - Server: sent in every LoRa packet, shown on the server OLED as `Fire: ...`, and printed to serial as `Fire: <LEVEL> (reasons: ...)`.

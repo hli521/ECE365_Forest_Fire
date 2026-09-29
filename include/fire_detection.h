@@ -50,9 +50,17 @@ struct Assessment {
 
 inline Level maxLevel(Level a, Level b) { return a > b ? a : b; }
 
+// Fire thresholds use OR: any one sensor crossing its fire threshold raises
+// Fire, so a fire seen by only one sensor is not missed. Surveillance uses
+// AND: it is raised only when every risk sensor with a valid reading (PM2.5
+// and humidity) crosses its surveillance threshold, so dry air alone, or
+// haze in humid air, does not raise a warning. A sensor without a valid
+// reading is left out of the AND.
 inline Assessment assess(const Readings &r) {
   Assessment result;
   bool anyData = false;
+  uint8_t riskSensors = 0;
+  uint8_t riskSignals = 0;
 
   if (!isnan(r.maxTempC)) {
     anyData = true;
@@ -67,22 +75,29 @@ inline Assessment assess(const Readings &r) {
 
   if (!isnan(r.pm25)) {
     anyData = true;
+    riskSensors++;
     if (r.pm25 > PM25_FIRE_UGM3) {
       result.level = maxLevel(result.level, Level::Fire);
       result.reasons |= REASON_SMOKE | REASON_HAZE;
+      riskSignals++;
     } else if (r.pm25 > PM25_SURVEILLANCE_UGM3) {
-      result.level = maxLevel(result.level, Level::Surveillance);
       result.reasons |= REASON_HAZE;
+      riskSignals++;
     }
   }
 
   // Dry air raises fire risk but does not indicate a fire by itself.
   if (!isnan(r.humidityPct)) {
     anyData = true;
+    riskSensors++;
     if (r.humidityPct < DRY_HUMIDITY_PCT) {
-      result.level = maxLevel(result.level, Level::Surveillance);
       result.reasons |= REASON_DRY;
+      riskSignals++;
     }
+  }
+
+  if (riskSensors > 0 && riskSignals == riskSensors) {
+    result.level = maxLevel(result.level, Level::Surveillance);
   }
 
   if (!anyData) result.reasons |= REASON_NO_DATA;
