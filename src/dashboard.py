@@ -239,11 +239,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="unavailable" id="pmUnavailable" style="display:none;">unavailable</div>
     </div>
     <div class="card">
-      <h2>Temperature</h2>
+      <h2>DHT11 &middot; Air temperature</h2>
       <div id="tempReading">
         <div class="value"><span id="temp">&mdash;</span><span class="unit">&deg;C</span></div>
       </div>
       <div class="unavailable" id="tempUnavailable" style="display:none;">unavailable</div>
+    </div>
+    <div class="card">
+      <h2>Grid-EYE &middot; Max temperature</h2>
+      <div id="gridTempReading">
+        <div class="value"><span id="gridTempMax">&mdash;</span><span class="unit">&deg;C</span></div>
+        <div class="subline">Avg <span id="gridTempAvg">&mdash;</span> &deg;C &middot; Min <span id="gridTempMin">&mdash;</span> &deg;C</div>
+        <div class="subline">Surface temperature (thermal pixels)</div>
+      </div>
+      <div class="unavailable" id="gridTempUnavailable" style="display:none;">unavailable</div>
     </div>
     <div class="card">
       <h2>DHT11 &middot; Humidity</h2>
@@ -317,7 +326,16 @@ async function refresh() {
     document.getElementById('rssi').textContent = d.hasData ? d.rssi.toFixed(1) : '—';
     document.getElementById('snr').textContent = d.hasData ? d.snr.toFixed(1) : '—';
 
-    if (d.hasData && d.gridEyeValid) {
+    const gridTemps = d.hasData && d.gridEyeValid
+      ? d.gridEye.filter(v => Number.isFinite(v)) : [];
+    const gridOk = gridTemps.length > 0;
+    document.getElementById('gridTempReading').style.display = gridOk ? '' : 'none';
+    document.getElementById('gridTempUnavailable').style.display = gridOk ? 'none' : '';
+    if (gridOk) {
+      document.getElementById('gridTempMax').textContent = Math.max(...gridTemps).toFixed(1);
+      document.getElementById('gridTempMin').textContent = Math.min(...gridTemps).toFixed(1);
+      document.getElementById('gridTempAvg').textContent =
+        (gridTemps.reduce((sum, t) => sum + t, 0) / gridTemps.length).toFixed(1);
       document.getElementById('gridBlock').innerHTML = '';
       document.getElementById('gridBlock').appendChild(canvas);
       renderGrid(d.gridEye);
