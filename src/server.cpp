@@ -3,19 +3,19 @@
 // pio run -e heltec_lora_server -t upload --upload-port /dev/cu.usbserial-YYYY
 //
 // This board only receives LoRa packets and prints them over USB Serial -
-// same as your original file, plus one extra line per packet: a compact
-// JSON summary (prefixed with "JSON:") that the local dashboard.py script
-// (running on your computer) reads and turns into a live webpage.
+// dashboard.py parses the human-readable sensor lines into a live webpage.
+// A compact JSON summary (prefixed with "JSON:") is also emitted.
 // No WiFi involved - the board never joins any network.
 
 #include <Arduino.h>
 #include <heltec_unofficial.h>
 #include <stdint.h>
 #include "fire_detection.h"
+#include "sensor_packet.h"
 
 // Match the frequency and RadioLib defaults used by device.cpp.
 constexpr float LORA_FREQUENCY_MHZ = 915.0f;
-constexpr size_t PACKET_SIZE = 4 + 4 + 1 + 64 * 2 + 3 * 2 + 2 * 2 + 2;
+constexpr size_t PACKET_SIZE = sensor_packet::MAX_SIZE;
 uint8_t packet[PACKET_SIZE];
 bool radioReady = false;
 
@@ -30,9 +30,10 @@ uint32_t readU32(size_t &offset) {
   return value | (static_cast<uint32_t>(readU16(offset)) << 16);
 }
 
-void printJsonLine(uint32_t sequence, uint8_t valid, int16_t gridEye[64],
+void printJsonLine(uint32_t sequence, uint8_t present, uint8_t valid, int16_t gridEye[64],
                     uint16_t pm1, uint16_t pm25, uint16_t pm10,
                     int16_t temperature, int16_t humidity,
+                    int16_t mlxObject, int16_t mlxAmbient,
                     fire::Level fireLevel, const char *fireReasons) {
   Serial.println("DEBUG: entered printJsonLine");
 
@@ -45,6 +46,7 @@ void printJsonLine(uint32_t sequence, uint8_t valid, int16_t gridEye[64],
   json += "\"rssi\":" + String(radio.getRSSI(), 1) + ",";
   json += "\"snr\":" + String(radio.getSNR(), 1) + ",";
 
+  json += "\"sensorsPresent\":" + String(present) + ",";
   bool gridValid = valid & 1;
   json += "\"gridEyeValid\":" + String(gridValid ? "true" : "false") + ",";
   json += "\"gridEye\":[";
@@ -62,6 +64,9 @@ void printJsonLine(uint32_t sequence, uint8_t valid, int16_t gridEye[64],
   bool dhtValid = valid & 4;
   json += "\"dhtValid\":" + String(dhtValid ? "true" : "false") + ",";
   json += "\"temperature\":" + String(temperature / 10.0f, 1) + ",\"humidity\":" + String(humidity / 10.0f, 1) + ",";
+  json += "\"mlxValid\":" + String((valid & sensor_packet::MLX) ? "true" : "false") + ",";
+  json += "\"mlxObject\":" + String(mlxObject / 10.0f, 1) + ",";
+  json += "\"mlxAmbient\":" + String(mlxAmbient / 10.0f, 1) + ",";
   json += "\"fireLevel\":\"" + String(fire::levelName(fireLevel)) + "\",";
   json += "\"fireReasons\":\"" + String(fireReasons) + "\"";
   json += "}";
@@ -87,13 +92,14 @@ void loop() {
     return;
   }
 
-  size_t length = PACKET_SIZE;
-  int16_t state = radio.receive(packet, length);
+  int16_t state = radio.receive(packet, sizeof(packet));
   if (state != RADIOLIB_ERR_NONE) {
     Serial.printf("LoRa receive error: %d\n", state);
     return;
   }
-  if (length != PACKET_SIZE || memcmp(packet, "FFS2", 4) != 0) {
+  // receive() takes capacity by value; query the actual received length.
+  size_t length = radio.getPacketLength();
+  if (!sensor_packet::validPacket(packet, length)) {
     Serial.printf("Ignored packet: %u bytes or wrong protocol\n",
                   static_cast<unsigned>(length));
     return;
@@ -101,23 +107,28 @@ void loop() {
 
   size_t offset = 4;
   uint32_t sequence = readU32(offset);
+  uint8_t present = packet[offset++];
   uint8_t valid = packet[offset++];
   Serial.printf("\nPacket %lu, RSSI %.1f dBm, SNR %.1f dB\n",
                 static_cast<unsigned long>(sequence), radio.getRSSI(), radio.getSNR());
   Serial.printf("Grid-EYE: %s\n", valid & 1 ? "valid" : "unavailable");
   int16_t gridEye[64];
   for (int i = 0; i < 64; ++i) {
-    int16_t pixel = static_cast<int16_t>(readU16(offset));
+    int16_t pixel = (present & sensor_packet::GRID)
+                        ? static_cast<int16_t>(readU16(offset)) : INT16_MIN;
     gridEye[i] = pixel;
+    if (!(present & sensor_packet::GRID)) continue;
     if (pixel == INT16_MIN) Serial.print("ERR");
     else Serial.print(pixel / 10.0f, 1);
     Serial.print(i % 8 == 7 ? '\n' : '\t');
   }
-  uint16_t pm1 = readU16(offset);
-  uint16_t pm25 = readU16(offset);
-  uint16_t pm10 = readU16(offset);
-  int16_t temperature = static_cast<int16_t>(readU16(offset));
-  int16_t humidity = static_cast<int16_t>(readU16(offset));
+  uint16_t pm1 = (present & sensor_packet::AIR) ? readU16(offset) : 0;
+  uint16_t pm25 = (present & sensor_packet::AIR) ? readU16(offset) : 0;
+  uint16_t pm10 = (present & sensor_packet::AIR) ? readU16(offset) : 0;
+  int16_t temperature = (present & sensor_packet::DHT) ? static_cast<int16_t>(readU16(offset)) : 0;
+  int16_t humidity = (present & sensor_packet::DHT) ? static_cast<int16_t>(readU16(offset)) : 0;
+  int16_t mlxObject = (present & sensor_packet::MLX) ? static_cast<int16_t>(readU16(offset)) : 0;
+  int16_t mlxAmbient = (present & sensor_packet::MLX) ? static_cast<int16_t>(readU16(offset)) : 0;
   uint8_t rawFireLevel = packet[offset++];
   uint8_t fireReasonBits = packet[offset++];
   fire::Level fireLevel = rawFireLevel <= static_cast<uint8_t>(fire::Level::Response)
@@ -128,6 +139,10 @@ void loop() {
   if (valid & 2) {
     Serial.printf("PMSA003I: PM1=%u PM2.5=%u PM10=%u ug/m3\n", pm1, pm25, pm10);
   } else Serial.println("PMSA003I: unavailable");
+  if (valid & sensor_packet::MLX) {
+    Serial.printf("MLX90614: Object=%.1f C, Ambient=%.1f C\n",
+                  mlxObject / 10.0f, mlxAmbient / 10.0f);
+  } else Serial.println("MLX90614: unavailable");
   // Keep the DHT11 line last: dashboard.py treats it as the end of a packet.
   Serial.printf("Fire: %s (reasons: %s)\n", fire::levelName(fireLevel), fireReasons);
   if (valid & 4) {
@@ -135,8 +150,8 @@ void loop() {
                   temperature / 10.0f, humidity / 10.0f);
   } else Serial.println("DHT11: unavailable");
 
-  printJsonLine(sequence, valid, gridEye, pm1, pm25, pm10, temperature, humidity,
-                fireLevel, fireReasons);
+  printJsonLine(sequence, present, valid, gridEye, pm1, pm25, pm10, temperature, humidity,
+                mlxObject, mlxAmbient, fireLevel, fireReasons);
 
   display.clear();
   display.drawString(0, 0, "Packet " + String(sequence));

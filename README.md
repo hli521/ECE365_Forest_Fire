@@ -12,7 +12,7 @@ The server is firmware on the second Heltec board. No desktop server, Wi-Fi conn
 ## Requirements
 
 - Two **Heltec WiFi LoRa 32 V3** boards, suitable LoRa antennas, and USB data cables. Attach antennas before powering the radios.
-- Grid-EYE thermal sensor, PMSA003I I2C particulate sensor, and DHT11 for the device board.
+- Any combination of Grid-EYE thermal sensor, PMSA003I I2C particulate sensor, DHT11, and HW-691 (MLX90614) for the device board.
 - VS Code with PlatformIO IDE, or PlatformIO Core installed separately.
 - Internet access for the first build to download the platform, toolchain, and libraries listed in `platformio.ini`.
 
@@ -29,6 +29,8 @@ Disconnect power before changing connections. The server needs no external senso
 | PMSA003I SDA | GPIO41, shared with Grid-EYE |
 | PMSA003I SCL | GPIO42, shared with Grid-EYE |
 | DHT11 DATA | GPIO4 |
+| HW-691 SDA | GPIO41, shared I2C bus |
+| HW-691 SCL | GPIO42, shared I2C bus |
 | All sensor grounds | Heltec GND, including any external power supply ground |
 
 Use the power supply specified for your exact sensor or breakout board; the table above covers signal wiring. The [bare PMSA003I module](https://www.adafruit.com/product/4505) needs 5V power and 3.3V I2C logic with external pull-ups. Breakout boards can include power conversion and pull-ups; check their documentation before wiring. Keep signals connected to the Heltec at 3.3V logic levels.
@@ -39,9 +41,28 @@ The device uses the second I2C controller at 100 kHz for GPIO41/42. The onboard 
 
 - Grid-EYE: `0x69` by default, or `0x68` with its address jumper closed; the code tries both.
 - PMSA003I: `0x12`. Confirm that the sensor is the I2C model.
+- HW-691 (MLX90614): `0x5A` by default; configurable with `MLX_ADDRESS` in `src/device.cpp`.
 - DHT11: uses GPIO4 directly and does not appear in an I2C scan.
 
 The code selects `DHT11` in `src/device.cpp`. If your sensor is a DHT22, change `DHT_TYPE` to `DHT22` before building. The current display/log labels still say DHT11.
+
+## Automatic sensor detection and packets
+
+At startup, the device probes Grid-EYE at `0x69`/`0x68`, initializes PMSA003I at `0x12` and MLX90614 at `0x5A`, and tries up to three DHT readings, two seconds apart, after the initial three-second startup wait. Only detected sensors are read during normal operation and included in LoRa packets. I2C address probes assume the expected sensor is wired at that address; they do not identify arbitrary sensor models.
+
+The `FFS4` packet contains magic (4 bytes), sequence (4), sensor presence (1), reading validity (1), the detected sensors' data, and fire level/reasons (2). Both masks use bit 0 for Grid-EYE, bit 1 for PMSA003I, bit 2 for DHT11, and bit 3 for MLX90614. Data appears in that order: thermal pixels (128 bytes), particulate values (6), DHT temperature/humidity (4), and MLX object/ambient temperatures (4). Multi-byte values are little endian; temperatures and humidity use tenths, and PM uses µg/m³.
+
+Examples: DHT-only packets are 16 bytes, PM-only packets are 18 bytes, MLX-only packets are 16 bytes, and packets with all four sensors are 154 bytes. With no sensors, the device sends a 12-byte status packet with the `no-sensor-data` reason. Presence stays fixed until reset; temporary read failures clear validity but retain the detected sensor's fields (invalid thermal pixels use `INT16_MIN`; invalid PM/DHT/MLX readings use zero). The receiver checks packet length and masks before decoding. The existing dashboard continues to show unavailable sensors as unavailable.
+
+**Rebuild and upload both boards:** `FFS4` replaces `FFS3` and `FFS2`; older receiver firmware cannot decode it. Restart `src/dashboard.py` to load the new HW-691 card. Reset the device after adding sensors or correcting a failed startup connection.
+
+### HW-691 / MLX90614
+
+Connect SDA to GPIO41, SCL to GPIO42, and GND to common ground. Power the breakout according to its marked voltage requirements, keeping SDA/SCL pull-ups at 3.3 V for the ESP32. HW-691 support assumes the MLX90614 I2C module; no sensor address or calibration EEPROM is changed. The default address and API follow the [Adafruit MLX90614 library](https://github.com/adafruit/Adafruit-MLX90614-Library).
+
+A startup message reports `HW-691/MLX90614 found at 0x5A`. Once detected, object and sensor-ambient temperatures are read every second; failed or out-of-range readings are marked invalid and retried. Validity requires both readings within the [manufacturer's calibrated ranges](https://www.melexis.com/en/product/MLX90614/Factory-Calibrated-Infrared-Temperature-Sensor): object −70 to 380 °C and ambient −40 to 125 °C. The device OLED alternates thermal sensors every three seconds when both are present. The receiver prints both readings, and the dashboard has a dedicated HW-691 card.
+
+Object temperature uses the existing fire thresholds (>50 °C Fire, >80 °C Response), with three consecutive assessments required. The hotter available reading from MLX90614 and Grid-EYE is used. A missing HW-691 adds no fields to the radio packet; a detected one adds four bytes. Reset after connecting a sensor that was absent at startup.
 
 ## Build both programs
 
@@ -138,7 +159,7 @@ A sensor without a current valid reading is skipped. If no sensor has a valid re
 
 | Measurement | Sensor | Status | Normal | Surveillance | Fire |
 | --- | --- | --- | --- | --- | --- |
-| Temperature | Grid-EYE (hottest pixel) and DHT11 (air) | Connected, active | ≤ 50 °C | — | > 50 °C; automatic response > 80 °C |
+| Temperature | Grid-EYE (hottest pixel) and MLX90614 (object) | Connected, active | ≤ 50 °C | — | > 50 °C; automatic response > 80 °C |
 | Relative humidity | DHT11 | Connected, active | ≥ 50 % | < 50 % | — (dry air alone never means fire) |
 | PM2.5 | PMSA003I | Connected, active | ≤ 50 µg/m³ | > 50 to 150 µg/m³ | > 150 µg/m³ |
 | Flame | Flame sensor | Not connected | — | — | Reading below 100, or 760–1100 nm flame radiation detected |
@@ -150,7 +171,7 @@ Thresholds come from a prior study ([8] in the project report). The study notes 
 
 Notes on the active sensors:
 
-- The DHT11 measures only up to 50 °C, so it cannot report a fire temperature alone. The Grid-EYE's hottest pixel provides the fire temperature.
+- The DHT11 measures only up to 50 °C, so it cannot report a fire temperature alone. The hotter valid value from Grid-EYE and MLX90614 object temperature provides the fire temperature. DHT temperature and MLX ambient temperature are transmitted but do not trigger fire detection.
 - The Grid-EYE's hottest pixel is a surface temperature, not air temperature. Strongly sunlit surfaces can exceed 50 °C.
 - The standard Grid-EYE measures up to about 80 °C, so the > 80 °C level may not trigger unless the sensor is the high-gain model.
 
@@ -160,7 +181,7 @@ Notes on the active sensors:
 2. Read it in `src/device.cpp` and keep a validity flag, like the existing sensors.
 3. Add its thresholds as constants and a field in `fire::Readings` in `include/fire_detection.h`, and evaluate them in `fire::assess()`. Add a `REASON_...` bit for it and print that bit in `printFireReasons()` in `src/device.cpp`.
 4. Pass the reading from `checkForFire()` in `src/device.cpp`, using `NAN` when the reading is invalid.
-5. The fire level and reasons already reach the server and dashboard; new `REASON_...` bits need only a label in `fire::describeReasons()`. To send the raw reading too, extend the packet format in both `src/device.cpp` and `src/server.cpp`, update `PACKET_SIZE` in both files, and change the packet magic (currently `FFS2`) so old firmware ignores the new format.
+5. The fire level and reasons already reach the server and dashboard; new `REASON_...` bits need only a label in `fire::describeReasons()`. To send the raw reading too, extend the packet format in both `src/device.cpp` and `src/server.cpp`, update `include/sensor_packet.h`, and change the packet magic (currently `FFS4`) so old firmware ignores the new format.
 6. Update the table above from `Not connected` to `Connected, active`.
 
 ## Troubleshooting
@@ -179,4 +200,4 @@ Notes on the active sensors:
 | Device reports packets sent but server receives none | Confirm both boards run their respective programs, use matching radio settings, have antennas attached, and are powered. A successful transmit log is not a receiver acknowledgement. |
 | `LoRa ... initialization failed` | Confirm the physical board is the configured Heltec WiFi LoRa 32 V3 and inspect the reported error code. |
 
-**Current startup limitation:** Grid-EYE detection and PMSA003I initialization happen only once. If either fails at startup, the repeated I2C scan does not reinitialize it. Fix the connection or power issue and reset the device. DHT reads retry automatically.
+**Startup detection:** The sensor set is fixed at startup. The repeated I2C scan is diagnostic only. If a sensor is absent or fails startup detection, fix its connection or power and reset the device. Sensors detected at startup continue to retry measurement reads after temporary failures.

@@ -4,7 +4,7 @@ Local LoRa sensor dashboard.
 
 Parses the normal human-readable lines the ESP32 already prints over USB
 Serial (the same output you see in `pio device monitor` - "Packet N...",
-the Grid-EYE grid, "PMSA003I: ..." and "DHT11: ...") and serves a
+the Grid-EYE grid, "PMSA003I: ...", "MLX90614: ..." and "DHT11: ...") and serves a
 live-updating dashboard at http://localhost:8000 - viewable only on this
 computer. No WiFi on the board needed, and no special JSON output required
 from the firmware.
@@ -50,6 +50,8 @@ PM_VALID_RE = re.compile(
 PM_INVALID_RE = re.compile(r"^PMSA003I:\s*unavailable\s*$", re.IGNORECASE)
 DHT_VALID_RE = re.compile(r"^DHT11: (-?\d+\.?\d*) C, (-?\d+\.?\d*) % RH$")
 DHT_INVALID_RE = re.compile(r"^DHT11: unavailable$")
+MLX_VALID_RE = re.compile(r"^MLX90614: Object=(-?\d+\.?\d*) C, Ambient=(-?\d+\.?\d*) C$")
+MLX_INVALID_RE = re.compile(r"^MLX90614: unavailable$")
 FIRE_RE = re.compile(r"^Fire: (NORMAL|SURVEILLANCE|FIRE|FIRE >80C) \(reasons: (.*)\)$")
 
 
@@ -93,6 +95,9 @@ def _finalize(ctx):
         "dhtValid": bool(ctx.get("dhtValid")),
         "temperature": ctx.get("temperature", 0.0),
         "humidity": ctx.get("humidity", 0.0),
+        "mlxValid": bool(ctx.get("mlxValid")),
+        "mlxObject": ctx.get("mlxObject", 0.0),
+        "mlxAmbient": ctx.get("mlxAmbient", 0.0),
         # None when the server firmware predates fire detection.
         "fireLevel": ctx.get("fireLevel"),
         "fireReasons": ctx.get("fireReasons"),
@@ -141,6 +146,15 @@ def _process_line(line: str, ctx: dict) -> dict:
         # Didn't match either pattern - print exactly what we got (with any
         # hidden/odd characters visible via repr) so the regex can be fixed.
         print(f"DEBUG: unrecognized PMSA003I line: {line!r}")
+        return ctx
+
+    m = MLX_VALID_RE.match(line)
+    if m:
+        ctx["mlxValid"] = True
+        ctx["mlxObject"], ctx["mlxAmbient"] = float(m.group(1)), float(m.group(2))
+        return ctx
+    if MLX_INVALID_RE.match(line):
+        ctx["mlxValid"] = False
         return ctx
 
     m = FIRE_RE.match(line)
@@ -244,6 +258,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="value"><span id="temp">&mdash;</span><span class="unit">&deg;C</span></div>
       </div>
       <div class="unavailable" id="tempUnavailable" style="display:none;">unavailable</div>
+    </div>
+    <div class="card">
+      <h2>HW-691 &middot; IR object temperature</h2>
+      <div id="mlxReading">
+        <div class="value"><span id="mlxObject">&mdash;</span><span class="unit">&deg;C</span></div>
+        <div class="subline">Sensor ambient <span id="mlxAmbient">&mdash;</span> &deg;C</div>
+      </div>
+      <div class="unavailable" id="mlxUnavailable" style="display:none;">unavailable</div>
     </div>
     <div class="card">
       <h2>Grid-EYE &middot; Max temperature</h2>
@@ -350,6 +372,14 @@ async function refresh() {
       document.getElementById('pm25').textContent = d.pm25;
       document.getElementById('pm1').textContent = d.pm1;
       document.getElementById('pm10').textContent = d.pm10;
+    }
+
+    const mlxOk = d.hasData && d.mlxValid;
+    document.getElementById('mlxReading').style.display = mlxOk ? '' : 'none';
+    document.getElementById('mlxUnavailable').style.display = mlxOk ? 'none' : '';
+    if (mlxOk) {
+      document.getElementById('mlxObject').textContent = d.mlxObject.toFixed(1);
+      document.getElementById('mlxAmbient').textContent = d.mlxAmbient.toFixed(1);
     }
 
     const dhtOk = d.hasData && d.dhtValid;
