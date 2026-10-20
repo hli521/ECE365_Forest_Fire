@@ -52,6 +52,8 @@ DHT_VALID_RE = re.compile(r"^DHT11: (-?\d+\.?\d*) C, (-?\d+\.?\d*) % RH$")
 DHT_INVALID_RE = re.compile(r"^DHT11: unavailable$")
 MLX_VALID_RE = re.compile(r"^MLX90614: Object=(-?\d+\.?\d*) C, Ambient=(-?\d+\.?\d*) C$")
 MLX_INVALID_RE = re.compile(r"^MLX90614: unavailable$")
+SVM_VALID_RE = re.compile(r"^SVM41: Temp=(-?\d+\.?\d*) C, RH=(\d+\.?\d*) %, VOC=(\d+\.?\d*), NOx=(\d+\.?\d*)$")
+SVM_INVALID_RE = re.compile(r"^SVM41: unavailable$")
 FIRE_RE = re.compile(r"^Fire: (NORMAL|SURVEILLANCE|FIRE|FIRE >80C) \(reasons: (.*)\)$")
 
 
@@ -95,6 +97,11 @@ def _finalize(ctx):
         "dhtValid": bool(ctx.get("dhtValid")),
         "temperature": ctx.get("temperature", 0.0),
         "humidity": ctx.get("humidity", 0.0),
+        "svmValid": bool(ctx.get("svmValid")),
+        "svmTemperature": ctx.get("svmTemperature", 0.0),
+        "svmHumidity": ctx.get("svmHumidity", 0.0),
+        "svmVoc": ctx.get("svmVoc", 0.0),
+        "svmNox": ctx.get("svmNox", 0.0),
         "mlxValid": bool(ctx.get("mlxValid")),
         "mlxObject": ctx.get("mlxObject", 0.0),
         "mlxAmbient": ctx.get("mlxAmbient", 0.0),
@@ -155,6 +162,16 @@ def _process_line(line: str, ctx: dict) -> dict:
         return ctx
     if MLX_INVALID_RE.match(line):
         ctx["mlxValid"] = False
+        return ctx
+
+    m = SVM_VALID_RE.match(line)
+    if m:
+        ctx["svmValid"] = True
+        for key, value in zip(("svmTemperature", "svmHumidity", "svmVoc", "svmNox"), m.groups()):
+            ctx[key] = float(value)
+        return ctx
+    if SVM_INVALID_RE.match(line):
+        ctx["svmValid"] = False
         return ctx
 
     m = FIRE_RE.match(line)
@@ -258,6 +275,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="value"><span id="temp">&mdash;</span><span class="unit">&deg;C</span></div>
       </div>
       <div class="unavailable" id="tempUnavailable" style="display:none;">unavailable</div>
+    </div>
+    <div class="card">
+      <h2>SVM41 &middot; Gas indices</h2>
+      <div id="svmReading">
+        <div class="subline">VOC Index <span id="svmVoc">&mdash;</span></div>
+        <div class="subline">NOx Index <span id="svmNox">&mdash;</span></div>
+        <div class="subline"><span id="svmTemperature">&mdash;</span> &deg;C &middot; <span id="svmHumidity">&mdash;</span> % RH</div>
+        <div class="subline">Unitless indices (not ppm)</div>
+      </div>
+      <div class="unavailable" id="svmUnavailable" style="display:none;">unavailable</div>
     </div>
     <div class="card">
       <h2>HW-691 &middot; IR object temperature</h2>
@@ -372,6 +399,15 @@ async function refresh() {
       document.getElementById('pm25').textContent = d.pm25;
       document.getElementById('pm1').textContent = d.pm1;
       document.getElementById('pm10').textContent = d.pm10;
+    }
+
+    const svmOk = d.hasData && d.svmValid;
+    document.getElementById('svmReading').style.display = svmOk ? '' : 'none';
+    document.getElementById('svmUnavailable').style.display = svmOk ? 'none' : '';
+    if (svmOk) {
+      for (const key of ['svmTemperature', 'svmHumidity', 'svmVoc', 'svmNox']) {
+        document.getElementById(key).textContent = d[key].toFixed(1);
+      }
     }
 
     const mlxOk = d.hasData && d.mlxValid;

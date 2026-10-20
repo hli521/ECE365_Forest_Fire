@@ -34,6 +34,7 @@ void printJsonLine(uint32_t sequence, uint8_t present, uint8_t valid, int16_t gr
                     uint16_t pm1, uint16_t pm25, uint16_t pm10,
                     int16_t temperature, int16_t humidity,
                     int16_t mlxObject, int16_t mlxAmbient,
+                    const int16_t svm[4],
                     fire::Level fireLevel, const char *fireReasons) {
   Serial.println("DEBUG: entered printJsonLine");
 
@@ -67,6 +68,9 @@ void printJsonLine(uint32_t sequence, uint8_t present, uint8_t valid, int16_t gr
   json += "\"mlxValid\":" + String((valid & sensor_packet::MLX) ? "true" : "false") + ",";
   json += "\"mlxObject\":" + String(mlxObject / 10.0f, 1) + ",";
   json += "\"mlxAmbient\":" + String(mlxAmbient / 10.0f, 1) + ",";
+  json += "\"svmValid\":" + String((valid & sensor_packet::SVM) ? "true" : "false") + ",";
+  const char *svmKeys[] = {"svmTemperature", "svmHumidity", "svmVoc", "svmNox"};
+  for (int i = 0; i < 4; ++i) json += "\"" + String(svmKeys[i]) + "\":" + String(svm[i] / 10.0f, 1) + ",";
   json += "\"fireLevel\":\"" + String(fire::levelName(fireLevel)) + "\",";
   json += "\"fireReasons\":\"" + String(fireReasons) + "\"";
   json += "}";
@@ -129,6 +133,10 @@ void loop() {
   int16_t humidity = (present & sensor_packet::DHT) ? static_cast<int16_t>(readU16(offset)) : 0;
   int16_t mlxObject = (present & sensor_packet::MLX) ? static_cast<int16_t>(readU16(offset)) : 0;
   int16_t mlxAmbient = (present & sensor_packet::MLX) ? static_cast<int16_t>(readU16(offset)) : 0;
+  int16_t svm[4] = {};
+  if (present & sensor_packet::SVM) {
+    for (int16_t &value : svm) value = static_cast<int16_t>(readU16(offset));
+  }
   uint8_t rawFireLevel = packet[offset++];
   uint8_t fireReasonBits = packet[offset++];
   fire::Level fireLevel = rawFireLevel <= static_cast<uint8_t>(fire::Level::Response)
@@ -143,6 +151,10 @@ void loop() {
     Serial.printf("MLX90614: Object=%.1f C, Ambient=%.1f C\n",
                   mlxObject / 10.0f, mlxAmbient / 10.0f);
   } else Serial.println("MLX90614: unavailable");
+  if (valid & sensor_packet::SVM) {
+    Serial.printf("SVM41: Temp=%.1f C, RH=%.1f %%, VOC=%.1f, NOx=%.1f\n",
+                  svm[0] / 10.0f, svm[1] / 10.0f, svm[2] / 10.0f, svm[3] / 10.0f);
+  } else Serial.println("SVM41: unavailable");
   // Keep the DHT11 line last: dashboard.py treats it as the end of a packet.
   Serial.printf("Fire: %s (reasons: %s)\n", fire::levelName(fireLevel), fireReasons);
   if (valid & 4) {
@@ -151,7 +163,7 @@ void loop() {
   } else Serial.println("DHT11: unavailable");
 
   printJsonLine(sequence, present, valid, gridEye, pm1, pm25, pm10, temperature, humidity,
-                mlxObject, mlxAmbient, fireLevel, fireReasons);
+                mlxObject, mlxAmbient, svm, fireLevel, fireReasons);
 
   display.clear();
   display.drawString(0, 0, "Packet " + String(sequence));

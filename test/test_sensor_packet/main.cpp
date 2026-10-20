@@ -5,8 +5,10 @@
 int main() {
   using namespace sensor_packet;
   const size_t expected[] = {12, 140, 18, 146, 16, 144, 22, 150,
-                             16, 144, 22, 150, 20, 148, 26, 154};
-  uint8_t packet[MAX_SIZE + 1] = {'F', 'F', 'S', '4'};
+                             16, 144, 22, 150, 20, 148, 26, 154,
+                             20, 148, 26, 154, 24, 152, 30, 158,
+                             24, 152, 30, 158, 28, 156, 34, 162};
+  uint8_t packet[MAX_SIZE + 1] = {'F', 'F', 'S', '5'};
   for (uint8_t present = 0; present <= ALL; ++present) {
     packet[8] = present;
     assert(packetSize(present) == expected[present]);
@@ -19,10 +21,10 @@ int main() {
       assert(validPacket(packet, length) == (length == expected[present]));
     }
   }
-  packet[8] = 16; packet[9] = 0;
+  packet[8] = 32; packet[9] = 0;
   assert(!validPacket(packet, 12));
   packet[8] = ALL; packet[9] = 128;
   assert(!validPacket(packet, MAX_SIZE));
-  packet[9] = ALL; packet[3] = '3';
+  packet[9] = ALL; packet[3] = '4';
   assert(!validPacket(packet, MAX_SIZE));
 }

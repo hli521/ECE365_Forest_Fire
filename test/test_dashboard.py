@@ -24,6 +24,8 @@ class DashboardTest(unittest.TestCase):
         if include_mlx:
             lines += ["MLX90614: Object=-12.3 C, Ambient=23.4 C" if valid & 8
                       else "MLX90614: unavailable"]
+        lines += ["SVM41: Temp=-5.2 C, RH=40.1 %, VOC=101.2, NOx=2.3" if valid & 16
+                  else "SVM41: unavailable"]
         lines += ["Fire: NORMAL (reasons: none)",
                   "DHT11: 24.0 C, 55.0 % RH" if valid & 4 else "DHT11: unavailable"]
         for line in lines:
@@ -31,16 +33,21 @@ class DashboardTest(unittest.TestCase):
         return process.__globals__["latest"]
 
     def test_all_sensor_combinations_and_failures(self):
-        for present in range(16):
-            for valid in range(16):
+        for present in range(32):
+            for valid in range(32):
                 if valid & ~present:
                     continue
                 with self.subTest(present=present, valid=valid):
                     data = self.feed_packet(present, valid)
                     for key, bit in [("gridEyeValid", 1), ("pmValid", 2),
-                                     ("dhtValid", 4), ("mlxValid", 8)]:
+                                     ("dhtValid", 4), ("mlxValid", 8), ("svmValid", 16)]:
                         self.assertEqual(data[key], bool(valid & bit))
                     self.assertEqual(len(data["gridEye"]), 64)
+                    if valid & 16:
+                        self.assertEqual(data["svmTemperature"], -5.2)
+                        self.assertEqual(data["svmHumidity"], 40.1)
+                        self.assertEqual(data["svmVoc"], 101.2)
+                        self.assertEqual(data["svmNox"], 2.3)
                     if valid & 8:
                         self.assertEqual(data["mlxObject"], -12.3)
                         self.assertEqual(data["mlxAmbient"], 23.4)

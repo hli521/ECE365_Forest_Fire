@@ -1,10 +1,9 @@
 // Threshold-based fire detection for the device board.
 //
-// Only the thresholds for sensors on this board are applied: temperature
-// (Grid-EYE and MLX90614 object), relative humidity (DHT11), and PM2.5 (PMSA003I).
-// The reference study's flame, CO2, smoke-ADC, and VOC thresholds need
-// sensors that are not connected yet. The README's "Fire detection" section
-// lists every threshold, its sensor, and how to add a sensor here.
+// Temperature: Grid-EYE, MLX object, and SVM41 ambient. Humidity: DHT11
+// with SVM41 fallback. Gas indices are provisional surveillance indicators,
+// not validated fire thresholds or concentration measurements.
+// See README for threshold rationale and limitations.
 //
 // This header has no Arduino dependencies so the logic can be tested on a
 // computer.
@@ -24,6 +23,11 @@ constexpr float DRY_HUMIDITY_PCT = 50.0f;       // surveillance below this
 constexpr float PM25_SURVEILLANCE_UGM3 = 50.0f; // surveillance above this
 constexpr float PM25_FIRE_UGM3 = 150.0f;        // fire condition above this
 
+// Project defaults: VOC >150 follows Sensirion's example air-treatment trigger;
+// NOx >50 is a project-selected elevated-index warning. Validate in deployment.
+constexpr float VOC_SURVEILLANCE_INDEX = 150.0f;
+constexpr float NOX_SURVEILLANCE_INDEX = 50.0f;
+
 enum class Level : uint8_t { Normal, Surveillance, Fire, Response };
 
 // Reasons are a bitmask so every threshold that was crossed can be reported.
@@ -33,6 +37,8 @@ enum Reason : uint8_t {
   REASON_SMOKE = 1 << 2,     // PM2.5 above 150 ug/m3
   REASON_HOT = 1 << 3,       // temperature above 50 C
   REASON_VERY_HOT = 1 << 4,  // temperature above 80 C
+  REASON_VOC = 1 << 6,      // VOC index above surveillance threshold
+  REASON_NOX = 1 << 7,      // NOx index above surveillance threshold
   REASON_NO_DATA = 1 << 5,   // no valid sensor reading to evaluate
 };
 
@@ -41,6 +47,8 @@ struct Readings {
   float maxTempC = NAN;  // hottest valid temperature from any sensor
   float humidityPct = NAN;
   float pm25 = NAN;
+  float vocIndex = NAN;
+  float noxIndex = NAN;
 };
 
 struct Assessment {
@@ -55,7 +63,8 @@ inline Level maxLevel(Level a, Level b) { return a > b ? a : b; }
 // AND: it is raised only when every risk sensor with a valid reading (PM2.5
 // and humidity) crosses its surveillance threshold, so dry air alone, or
 // haze in humid air, does not raise a warning. A sensor without a valid
-// reading is left out of the AND.
+// reading is left out of the AND. Gas-index warnings independently raise
+// Surveillance and do not suppress existing heat/PM alarms.
 inline Assessment assess(const Readings &r) {
   Assessment result;
   bool anyData = false;
@@ -98,6 +107,22 @@ inline Assessment assess(const Readings &r) {
 
   if (riskSensors > 0 && riskSignals == riskSensors) {
     result.level = maxLevel(result.level, Level::Surveillance);
+  }
+
+  // Zero/unavailable or out-of-range indices are excluded from assessment.
+  if (isfinite(r.vocIndex) && r.vocIndex >= 1 && r.vocIndex <= 500) {
+    anyData = true;
+    if (r.vocIndex > VOC_SURVEILLANCE_INDEX) {
+      result.level = maxLevel(result.level, Level::Surveillance);
+      result.reasons |= REASON_VOC;
+    }
+  }
+  if (isfinite(r.noxIndex) && r.noxIndex >= 1 && r.noxIndex <= 500) {
+    anyData = true;
+    if (r.noxIndex > NOX_SURVEILLANCE_INDEX) {
+      result.level = maxLevel(result.level, Level::Surveillance);
+      result.reasons |= REASON_NOX;
+    }
   }
 
   if (!anyData) result.reasons |= REASON_NO_DATA;
@@ -158,6 +183,8 @@ inline void describeReasons(uint8_t reasons, char *out, size_t size) {
   if (reasons & REASON_SMOKE) add("PM2.5>150");
   else if (reasons & REASON_HAZE) add("PM2.5>50");
   if (reasons & REASON_DRY) add("RH<50%");
+  if (reasons & REASON_VOC) add("VOC-high");
+  if (reasons & REASON_NOX) add("NOx-high");
   if (reasons & REASON_NO_DATA) add("no-sensor-data");
   if (out[0] == '\0') add("none");
 }

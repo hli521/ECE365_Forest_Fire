@@ -12,7 +12,7 @@ The server is firmware on the second Heltec board. No desktop server, Wi-Fi conn
 ## Requirements
 
 - Two **Heltec WiFi LoRa 32 V3** boards, suitable LoRa antennas, and USB data cables. Attach antennas before powering the radios.
-- Any combination of Grid-EYE thermal sensor, PMSA003I I2C particulate sensor, DHT11, and HW-691 (MLX90614) for the device board.
+- Any combination of Grid-EYE thermal sensor, PMSA003I I2C particulate sensor, DHT11, HW-691 (MLX90614), and SVM41 for the device board.
 - VS Code with PlatformIO IDE, or PlatformIO Core installed separately.
 - Internet access for the first build to download the platform, toolchain, and libraries listed in `platformio.ini`.
 
@@ -28,9 +28,12 @@ Disconnect power before changing connections. The server needs no external senso
 | Grid-EYE SCL | GPIO42 |
 | PMSA003I SDA | GPIO41, shared with Grid-EYE |
 | PMSA003I SCL | GPIO42, shared with Grid-EYE |
-| DHT11 DATA | GPIO4 |
+| DHT11 DATA | GPIO4 or GPIO3 (automatically detected) |
 | HW-691 SDA | GPIO41, shared I2C bus |
 | HW-691 SCL | GPIO42, shared I2C bus |
+| SVM41 SDA / SCL | GPIO41 / GPIO42 |
+| SVM41 VDD | 3.3V |
+| SVM41 GND and SEL | GND (SEL selects I2C mode) |
 | All sensor grounds | Heltec GND, including any external power supply ground |
 
 Use the power supply specified for your exact sensor or breakout board; the table above covers signal wiring. The [bare PMSA003I module](https://www.adafruit.com/product/4505) needs 5V power and 3.3V I2C logic with external pull-ups. Breakout boards can include power conversion and pull-ups; check their documentation before wiring. Keep signals connected to the Heltec at 3.3V logic levels.
@@ -41,20 +44,23 @@ The device uses the second I2C controller at 100 kHz for GPIO41/42. The onboard 
 
 - Grid-EYE: `0x69` by default, or `0x68` with its address jumper closed; the code tries both.
 - PMSA003I: `0x12`. Confirm that the sensor is the I2C model.
+- SVM41: `0x6A`, with SEL grounded for I2C.
 - HW-691 (MLX90614): `0x5A` by default; configurable with `MLX_ADDRESS` in `src/device.cpp`.
-- DHT11: uses GPIO4 directly and does not appear in an I2C scan.
+- DHT11: uses GPIO4 or GPIO3 directly and does not appear in an I2C scan.
+
+The device prefers GPIO4 at startup, then keeps using the last working DHT pin. If a reading fails, it tries the other pin. If neither pin succeeds during startup, reset after fixing the connection. Connect one DHT DATA wire to either pin.
 
 The code selects `DHT11` in `src/device.cpp`. If your sensor is a DHT22, change `DHT_TYPE` to `DHT22` before building. The current display/log labels still say DHT11.
 
 ## Automatic sensor detection and packets
 
-At startup, the device probes Grid-EYE at `0x69`/`0x68`, initializes PMSA003I at `0x12` and MLX90614 at `0x5A`, and tries up to three DHT readings, two seconds apart, after the initial three-second startup wait. Only detected sensors are read during normal operation and included in LoRa packets. I2C address probes assume the expected sensor is wired at that address; they do not identify arbitrary sensor models.
+At startup, the device probes Grid-EYE at `0x69`/`0x68`, initializes PMSA003I at `0x12`, MLX90614 at `0x5A`, and SVM41 at `0x6A`, and tries up to three DHT detection rounds on GPIO4 and GPIO3, two seconds apart, after the initial three-second startup wait. Only detected sensors are read during normal operation and included in LoRa packets. I2C address probes assume the expected sensor is wired at that address; they do not identify arbitrary sensor models.
 
-The `FFS4` packet contains magic (4 bytes), sequence (4), sensor presence (1), reading validity (1), the detected sensors' data, and fire level/reasons (2). Both masks use bit 0 for Grid-EYE, bit 1 for PMSA003I, bit 2 for DHT11, and bit 3 for MLX90614. Data appears in that order: thermal pixels (128 bytes), particulate values (6), DHT temperature/humidity (4), and MLX object/ambient temperatures (4). Multi-byte values are little endian; temperatures and humidity use tenths, and PM uses µg/m³.
+The `FFS5` packet contains magic (4 bytes), sequence (4), sensor presence (1), reading validity (1), the detected sensors' data, and fire level/reasons (2). Both masks use bit 0 for Grid-EYE, bit 1 for PMSA003I, bit 2 for DHT11, bit 3 for MLX90614, and bit 4 for SVM41. Data appears in that order: thermal pixels (128 bytes), particulate values (6), DHT temperature/humidity (4), MLX object/ambient temperatures (4), and SVM41 temperature/RH/VOC Index/NOx Index (8). SVM41 fields are signed 16-bit values in tenths of their respective units. Multi-byte values are little endian; temperatures and humidity use tenths, and PM uses µg/m³.
 
-Examples: DHT-only packets are 16 bytes, PM-only packets are 18 bytes, MLX-only packets are 16 bytes, and packets with all four sensors are 154 bytes. With no sensors, the device sends a 12-byte status packet with the `no-sensor-data` reason. Presence stays fixed until reset; temporary read failures clear validity but retain the detected sensor's fields (invalid thermal pixels use `INT16_MIN`; invalid PM/DHT/MLX readings use zero). The receiver checks packet length and masks before decoding. The existing dashboard continues to show unavailable sensors as unavailable.
+Examples: DHT-only packets are 16 bytes, PM-only packets are 18 bytes, MLX-only packets are 16 bytes, and packets with all five sensors are 162 bytes. With no sensors, the device sends a 12-byte status packet with the `no-sensor-data` reason. Presence stays fixed until reset; temporary read failures clear validity but retain the detected sensor's fields (invalid thermal pixels use `INT16_MIN`; invalid PM/DHT/MLX/SVM readings use zero). The receiver checks packet length and masks before decoding. The existing dashboard continues to show unavailable sensors as unavailable.
 
-**Rebuild and upload both boards:** `FFS4` replaces `FFS3` and `FFS2`; older receiver firmware cannot decode it. Restart `src/dashboard.py` to load the new HW-691 card. Reset the device after adding sensors or correcting a failed startup connection.
+**Rebuild and upload both boards:** `FFS5` replaces `FFS4` and earlier formats; older receiver firmware cannot decode it. Restart `src/dashboard.py` to load the SVM41 and HW-691 cards. Reset the device after adding sensors or correcting a failed startup connection.
 
 ### HW-691 / MLX90614
 
@@ -63,6 +69,14 @@ Connect SDA to GPIO41, SCL to GPIO42, and GND to common ground. Power the breako
 A startup message reports `HW-691/MLX90614 found at 0x5A`. Once detected, object and sensor-ambient temperatures are read every second; failed or out-of-range readings are marked invalid and retried. Validity requires both readings within the [manufacturer's calibrated ranges](https://www.melexis.com/en/product/MLX90614/Factory-Calibrated-Infrared-Temperature-Sensor): object −70 to 380 °C and ambient −40 to 125 °C. The device OLED alternates thermal sensors every three seconds when both are present. The receiver prints both readings, and the dashboard has a dedicated HW-691 card.
 
 Object temperature uses the existing fire thresholds (>50 °C Fire, >80 °C Response), with three consecutive assessments required. The hotter available reading from MLX90614 and Grid-EYE is used. A missing HW-691 adds no fields to the radio packet; a detected one adds four bytes. Reset after connecting a sensor that was absent at startup.
+
+### SVM41
+
+Support uses [Sensirion's I2C SVM4x driver](https://github.com/Sensirion/arduino-i2c-svm4x). Connect VDD to 3.3 V, GND and SEL to ground, SDA to GPIO41, and SCL to GPIO42. Ground SEL before powering on. The driver communicates with the complete SVM41 module, not a bare SGP41 sensor or the USB/UART adapter. The [I2C interface specification](https://sensirion.com/media/documents/EBF2BA04/61B8BA7C/Sensirion_Gas_Sensors_SEK-SVM4x_I2C_Interface_Description.pdf) specifies address `0x6A` and a maximum 100 kHz clock, matching the shared bus.
+
+At startup the firmware resets the module, reads its serial-number response, and starts continuous measurement. It waits at least one second before reading temperature, relative humidity, VOC Index, and NOx Index. Read/CRC failures clear validity and retry every second; failure to initialize excludes the sensor until the next board reset. A detected SVM41 adds eight bytes to each LoRa packet, even during a temporary read failure. With only SVM41 attached, packets are 20 bytes.
+
+The device OLED alternates SVM41 readings with the particulate rows. The receiver outputs them over serial and JSON, and the dashboard has a dedicated SVM41 card. VOC and NOx values are unitless indices, not ppm concentrations. SVM41 temperature participates in the heat thresholds, and its humidity is used when DHT11 has no valid reading. VOC/NOx thresholds raise surveillance as described below.
 
 ## Build both programs
 
@@ -141,7 +155,7 @@ The device board checks its readings against predefined thresholds once per seco
 | Level | Meaning | Device output |
 | --- | --- | --- |
 | `NORMAL` | No threshold crossed | LED off |
-| `SURVEILLANCE` | Fire-risk conditions: dry air and elevated PM2.5 together | LED dim |
+| `SURVEILLANCE` | Dry air and elevated PM2.5 together, or elevated VOC/NOx Index | LED dim |
 | `FIRE` | A fire threshold crossed | LED blinking |
 | `FIRE >80C` | Automatic-response temperature crossed | LED blinking |
 
@@ -159,21 +173,30 @@ A sensor without a current valid reading is skipped. If no sensor has a valid re
 
 | Measurement | Sensor | Status | Normal | Surveillance | Fire |
 | --- | --- | --- | --- | --- | --- |
-| Temperature | Grid-EYE (hottest pixel) and MLX90614 (object) | Connected, active | ≤ 50 °C | — | > 50 °C; automatic response > 80 °C |
-| Relative humidity | DHT11 | Connected, active | ≥ 50 % | < 50 % | — (dry air alone never means fire) |
+| Temperature | Grid-EYE (hottest pixel), MLX90614 (object), SVM41 (ambient) | Connected, active | ≤ 50 °C | — | > 50 °C; automatic response > 80 °C |
+| Relative humidity | DHT11, with SVM41 fallback | Connected, active | ≥ 50 % | < 50 % | — (dry air alone never means fire) |
 | PM2.5 | PMSA003I | Connected, active | ≤ 50 µg/m³ | > 50 to 150 µg/m³ | > 150 µg/m³ |
 | Flame | Flame sensor | Not connected | — | — | Reading below 100, or 760–1100 nm flame radiation detected |
 | CO₂ | Gas sensor | Not connected | — | — | Estimated CO₂ above 30 % |
 | Smoke (12-bit ADC, 0–4095) | Smoke sensor | Not connected | ≤ 1190 | > 1190 to 1984 | > 1984 |
-| VOCs | — | Not connected, no threshold | — | — | — |
+| VOC Index | SVM41 | Provisional risk warning | ≤ 150 | > 150 | No gas-only fire alarm |
+| NOx Index | SVM41 | Provisional risk warning | ≤ 50 | > 50 | No gas-only fire alarm |
 
 Thresholds come from a prior study ([8] in the project report). The study notes that VOCs can signal a fire before visible flames but are hard to detect outdoors because they dilute quickly, so no VOC threshold was defined.
 
 Notes on the active sensors:
 
-- The DHT11 measures only up to 50 °C, so it cannot report a fire temperature alone. The hotter valid value from Grid-EYE and MLX90614 object temperature provides the fire temperature. DHT temperature and MLX ambient temperature are transmitted but do not trigger fire detection.
+- The DHT11 measures only up to 50 °C, so it cannot report a fire temperature alone. The hottest valid value from Grid-EYE, MLX90614 object temperature, and SVM41 ambient temperature provides the fire temperature. DHT temperature and MLX ambient temperature are transmitted but do not trigger fire detection.
 - The Grid-EYE's hottest pixel is a surface temperature, not air temperature. Strongly sunlit surfaces can exceed 50 °C.
 - The standard Grid-EYE measures up to about 80 °C, so the > 80 °C level may not trigger unless the sensor is the high-gain model.
+
+### SVM41 threshold rationale
+
+`VOC_SURVEILLANCE_INDEX = 150` and `NOX_SURVEILLANCE_INDEX = 50` in `include/fire_detection.h` are configurable prototype defaults. Either index strictly above its threshold independently raises Surveillance, even when PM/humidity are normal. Both use the existing three-consecutive-assessment confirmation. Gas indices alone never raise Fire or Response, including when both are high. Invalid values, zero, and indices outside 1–500 are ignored.
+
+[Sensirion's VOC note](https://sensirion.com/media/documents/02232963/6294E043/Info_Note_VOC_Index.pdf) gives >150 as an example air-purifier trigger, not a fire threshold. The [NOx note](https://sensirion.com/media/documents/9F289B95/6294DFFC/Info_Note_NOx_Index.pdf) describes a baseline near 1; >50 is our project-selected warning threshold. These relative indices respond to other pollution sources and adapt to recent history. Neither value is a manufacturer-validated wildfire detection limit; validate and tune them against deployment data.
+
+SVM41 ambient temperature joins the existing >50 °C Fire and >80 °C Response checks. DHT11 remains the preferred humidity source, with SVM41 used only when DHT11 has no valid reading; the dry-air threshold remains <50% RH. Gas warnings appear as `VOC-high` / `NOx-high` in serial, receiver, and dashboard. Upload both firmware programs to display the new reason flags correctly; the packet layout remains FFS5.
 
 ### Adding a sensor that is not yet connected
 
@@ -181,7 +204,7 @@ Notes on the active sensors:
 2. Read it in `src/device.cpp` and keep a validity flag, like the existing sensors.
 3. Add its thresholds as constants and a field in `fire::Readings` in `include/fire_detection.h`, and evaluate them in `fire::assess()`. Add a `REASON_...` bit for it and print that bit in `printFireReasons()` in `src/device.cpp`.
 4. Pass the reading from `checkForFire()` in `src/device.cpp`, using `NAN` when the reading is invalid.
-5. The fire level and reasons already reach the server and dashboard; new `REASON_...` bits need only a label in `fire::describeReasons()`. To send the raw reading too, extend the packet format in both `src/device.cpp` and `src/server.cpp`, update `include/sensor_packet.h`, and change the packet magic (currently `FFS4`) so old firmware ignores the new format.
+5. The fire level and reasons already reach the server and dashboard; new `REASON_...` bits need only a label in `fire::describeReasons()`. To send the raw reading too, extend the packet format in both `src/device.cpp` and `src/server.cpp`, update `include/sensor_packet.h`, and change the packet magic (currently `FFS5`) so old firmware ignores the new format.
 6. Update the table above from `Not connected` to `Connected, active`.
 
 ## Troubleshooting
@@ -193,7 +216,7 @@ Notes on the active sensors:
 | Garbled serial output | Set the monitor to 115200 baud. |
 | `PMSA003I NOT found at 0x12` | Check power, common ground, SDA on GPIO41, SCL on GPIO42, and that the module uses I2C. The periodic scan should show `0x12`. |
 | `PMSA003I read failed` | The startup initialization succeeded, but a measurement read failed. Check supply stability and I2C wiring/pull-ups; reads retry each second. |
-| `DHT11 read failed (NaN)` | Check DATA on GPIO4, sensor power/ground, the pull-up, and whether the actual sensor is DHT11 or DHT22. Initialization logs alone do not prove the sensor responds. |
+| `DHT11 read failed on GPIO4 and GPIO3` | Check DATA on GPIO4 or GPIO3, sensor power/ground, the pull-up, and whether the actual sensor is DHT11 or DHT22. Initialization logs alone do not prove the sensor responds. |
 | Grid-EYE appears in a scan but remains “not found” | Its startup probe may have failed. Check connections and power, then reset the device. An address ACK alone does not prove reliable measurement reads. |
 | Server prints `Ignored packet: ... wrong protocol` | The two boards run firmware with different packet formats. Rebuild and upload both programs. |
 | Server reports sensor `unavailable` | A packet arrived, but the device marked that sensor's reading invalid. Inspect the device's serial output. |

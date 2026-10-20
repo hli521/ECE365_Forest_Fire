@@ -9,6 +9,7 @@
 #include <SparkFun_GridEYE_Arduino_Library.h>
 #include <Adafruit_PM25AQI.h>
 #include <Adafruit_MLX90614.h>
+#include <SensirionI2CSvm41.h>
 #include <DHT.h>              // Adafruit DHT sensor library
 #include <Adafruit_Sensor.h>  // Adafruit Unified Sensor (DHT library dependency)
 #include <stdint.h>
@@ -52,16 +53,60 @@ void readMlx() {
   lastMlxRead = millis();
 }
 
+// SVM41 in I2C mode (SEL tied to GND), sharing GPIO41/42.
+constexpr uint8_t SVM_ADDRESS = 0x6A;
+SensirionI2CSvm41 svm41;
+bool svmConnected = false;
+bool svmReadingValid = false;
+unsigned long lastSvmRead = 0;
+float svmTempC = NAN, svmHumidity = NAN, svmVoc = NAN, svmNox = NAN;
+
+void readSvm() {
+  uint16_t error = svm41.readMeasuredValues(svmHumidity, svmTempC, svmVoc, svmNox);
+  svmReadingValid = !error && isfinite(svmHumidity) && isfinite(svmTempC) &&
+                    isfinite(svmVoc) && isfinite(svmNox) &&
+                    svmHumidity >= 0 && svmHumidity <= 100 &&
+                    svmTempC >= -40 && svmTempC <= 125 &&
+                    svmVoc >= 0 && svmVoc <= 500 && svmNox >= 0 && svmNox <= 500;
+  if (svmReadingValid) {
+    Serial.printf("SVM41: Temp=%.1f C, RH=%.1f %%, VOC=%.1f, NOx=%.1f\n",
+                  svmTempC, svmHumidity, svmVoc, svmNox);
+  } else {
+    Serial.printf("SVM41 read failed or invalid (error %u); retrying next second\n", error);
+  }
+}
+
 // --- DHT11 setup ---
-constexpr int DHT_PIN = 4;
+constexpr int DHT_PINS[] = {4, 3};
+int activeDht = 0; // Prefer GPIO4 initially, then the last successful pin.
 #define DHT_TYPE DHT11
-DHT dht(DHT_PIN, DHT_TYPE);
+DHT dhtSensors[] = {DHT(DHT_PINS[0], DHT_TYPE), DHT(DHT_PINS[1], DHT_TYPE)};
 constexpr unsigned long DHT_READ_INTERVAL_MS = 2000; // DHT11 max ~1 Hz; 2s is safely conservative
 unsigned long lastDhtRead = 0;
 float dhtTempC = NAN;
 float dhtHumidity = NAN;
 bool dhtReadingValid = false;
 bool dhtConnected = false;
+// Each DHT instance retains its own read interval/cache.
+bool readDht() {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    int candidate = (activeDht + attempt) % 2;
+    float h = dhtSensors[candidate].readHumidity();
+    float t = dhtSensors[candidate].readTemperature();
+    if (!isfinite(h) || !isfinite(t)) continue;
+    if (candidate != activeDht) {
+      Serial.printf("DHT11 selected GPIO%d\n", DHT_PINS[candidate]);
+    }
+    activeDht = candidate;
+    dhtHumidity = h;
+    dhtTempC = t;
+    dhtReadingValid = true;
+    return true;
+  }
+  dhtReadingValid = false;
+  return false;
+}
+
 uint8_t sensorsPresent = 0;
 
 // --- Fire detection (thresholds in include/fire_detection.h) ---
@@ -89,9 +134,9 @@ unsigned long txTimeoutMs = 0;
 bool txInProgress = false;
 bool lastTxSucceeded = false;
 
-// FFS4 layout and sensor bits are defined in sensor_packet.h.
+// FFS5 layout and sensor bits are defined in sensor_packet.h.
 // Invalid detected sensors retain their fields: Grid-EYE uses INT16_MIN,
-// PM, DHT, and MLX use zero. Receivers must check validity before using values.
+// PM, DHT, MLX, and SVM use zero. Receivers must check validity before using values.
 void putU16(size_t &offset, uint16_t value) {
   packet[offset++] = static_cast<uint8_t>(value);
   packet[offset++] = static_cast<uint8_t>(value >> 8);
@@ -113,13 +158,14 @@ void sendSensorPacket() {
   packet[offset++] = 'F';
   packet[offset++] = 'F';
   packet[offset++] = 'S';
-  packet[offset++] = '4';
+  packet[offset++] = '5';
   putU32(offset, packetSequence++);
   packet[offset++] = sensorsPresent;
   packet[offset++] = (gridReadingValid ? 1 : 0) |
                      (airReadingValid ? 2 : 0) |
                      (dhtReadingValid ? 4 : 0) |
-                     (mlxReadingValid ? sensor_packet::MLX : 0);
+                     (mlxReadingValid ? sensor_packet::MLX : 0) |
+                     (svmReadingValid ? sensor_packet::SVM : 0);
   if (sensorsPresent & sensor_packet::GRID) {
     for (int16_t pixel : gridPixels) putU16(offset, static_cast<uint16_t>(pixel));
   }
@@ -135,6 +181,12 @@ void sendSensorPacket() {
   if (sensorsPresent & sensor_packet::MLX) {
     putU16(offset, mlxReadingValid ? static_cast<uint16_t>(toTenths(mlxObjectC)) : 0);
     putU16(offset, mlxReadingValid ? static_cast<uint16_t>(toTenths(mlxAmbientC)) : 0);
+  }
+  if (sensorsPresent & sensor_packet::SVM) {
+    putU16(offset, svmReadingValid ? static_cast<uint16_t>(toTenths(svmTempC)) : 0);
+    putU16(offset, svmReadingValid ? static_cast<uint16_t>(toTenths(svmHumidity)) : 0);
+    putU16(offset, svmReadingValid ? static_cast<uint16_t>(toTenths(svmVoc)) : 0);
+    putU16(offset, svmReadingValid ? static_cast<uint16_t>(toTenths(svmNox)) : 0);
   }
   packet[offset++] = static_cast<uint8_t>(fireLevel);
   packet[offset++] = fireReasons;
@@ -169,8 +221,8 @@ void serviceLoraTransmit() {
                 lastTxSucceeded ? "sent" : "failed", result);
 }
 
-// Use the hotter of Grid-EYE and MLX object temperature for detection.
-// DHT contributes humidity; DHT and MLX ambient temperatures are telemetry only.
+// Use the hottest valid Grid-EYE, MLX object, or SVM41 temperature.
+// DHT humidity takes precedence over SVM41 humidity.
 void checkForFire() {
   fire::Readings readings;
   if (gridReadingValid) readings.maxTempC = gridMaxTempC;
@@ -179,6 +231,12 @@ void checkForFire() {
   }
   if (dhtReadingValid) {
     readings.humidityPct = dhtHumidity;
+  }
+  if (svmReadingValid) {
+    if (isnan(readings.maxTempC) || svmTempC > readings.maxTempC) readings.maxTempC = svmTempC;
+    if (!dhtReadingValid) readings.humidityPct = svmHumidity;
+    readings.vocIndex = svmVoc;
+    readings.noxIndex = svmNox;
   }
   if (airReadingValid) readings.pm25 = airData.pm25_env;
 
@@ -189,9 +247,9 @@ void checkForFire() {
 
   char reasonText[64];
   fire::describeReasons(assessment.reasons, reasonText, sizeof(reasonText));
-  Serial.printf("Fire check: %s (current reading %s; max temp %.1f C, RH %.1f %%, PM2.5 %.0f ug/m3; reasons: %s)\n",
+  Serial.printf("Fire check: %s (current reading %s; max temp %.1f C, RH %.1f %%, PM2.5 %.0f ug/m3, VOC %.1f, NOx %.1f; reasons: %s)\n",
                 fire::levelName(fireLevel), fire::levelName(assessment.level),
-                readings.maxTempC, readings.humidityPct, readings.pm25, reasonText);
+                readings.maxTempC, readings.humidityPct, readings.pm25, readings.vocIndex, readings.noxIndex, reasonText);
   if (fireLevel != previous) {
     Serial.printf("*** FIRE LEVEL CHANGED: %s -> %s ***\n",
                   fire::levelName(previous), fire::levelName(fireLevel));
@@ -228,6 +286,7 @@ void scanSensorAddresses() {
     uint8_t result = gridEyeWire.endTransmission();
     if (result == 0) {
       const char *label = "unknown device";
+      if (addr == SVM_ADDRESS) label = "expected SVM41 address";
       if (addr == MLX_ADDRESS) label = "expected HW-691/MLX90614 address";
       if (addr == 0x12) label = "expected PMSA003I address";
       if (addr == 0x68 || addr == 0x69) label = "expected Grid-EYE address";
@@ -260,7 +319,7 @@ void setup() {
     Serial.println("ERROR: sensor I2C bus initialization failed");
   }
 
-  dht.begin();
+  for (DHT &sensor : dhtSensors) sensor.begin();
 
   // Allow the PMSA003I to boot before probing the shared sensor bus.
   delay(3000);
@@ -293,12 +352,23 @@ void setup() {
   Serial.printf("HW-691/MLX90614 %s at 0x%02X\n",
                 mlxConnected ? "found" : "NOT found", MLX_ADDRESS);
 
+  svm41.begin(gridEyeWire);
+  if (i2cPing(SVM_ADDRESS)) {
+    // Reset to idle so restarting the ESP32 also works with a powered module.
+    uint16_t error = svm41.deviceReset();
+    uint8_t serialNumber[32] = {};
+    if (!error) error = svm41.getSerialNumber(serialNumber, sizeof(serialNumber));
+    if (!error) error = svm41.startMeasurement();
+    svmConnected = error == 0;
+    if (error) Serial.printf("SVM41 startup failed: %u\n", error);
+  }
+  lastSvmRead = millis(); // First measurement is available after one second.
+  Serial.printf("SVM41 %s at 0x%02X\n", svmConnected ? "found" : "NOT found", SVM_ADDRESS);
+
   // DHT has no address probe. Require a successful measurement, allowing
   // three attempts so a single startup read failure does not exclude it.
   for (int attempt = 0; attempt < 3; ++attempt) {
-    dhtHumidity = dht.readHumidity();
-    dhtTempC = dht.readTemperature();
-    dhtConnected = !isnan(dhtHumidity) && !isnan(dhtTempC);
+    dhtConnected = readDht();
     if (dhtConnected) break;
     if (attempt < 2) delay(DHT_READ_INTERVAL_MS);
   }
@@ -307,9 +377,11 @@ void setup() {
   sensorsPresent = (gridEyeConnected ? sensor_packet::GRID : 0) |
                    (airQualityConnected ? sensor_packet::AIR : 0) |
                    (dhtConnected ? sensor_packet::DHT : 0) |
-                   (mlxConnected ? sensor_packet::MLX : 0);
-  Serial.printf("DHT11 %s on GPIO%d\n", dhtConnected ? "found" : "NOT found", DHT_PIN);
-  Serial.printf("Startup sensors: 0x%02X; FFS4 packets: %u bytes\n",
+                   (mlxConnected ? sensor_packet::MLX : 0) |
+                   (svmConnected ? sensor_packet::SVM : 0);
+  if (dhtConnected) Serial.printf("DHT11 found on GPIO%d\n", DHT_PINS[activeDht]);
+  else Serial.println("DHT11 NOT found on GPIO4 or GPIO3");
+  Serial.printf("Startup sensors: 0x%02X; FFS5 packets: %u bytes\n",
                 sensorsPresent, static_cast<unsigned>(sensor_packet::packetSize(sensorsPresent)));
 
   display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -393,16 +465,9 @@ void loop() {
   // --- DHT11 read + display ---
   if (dhtConnected && millis() - lastDhtRead >= DHT_READ_INTERVAL_MS) {
     lastDhtRead = millis();
-    float h = dht.readHumidity();
-    float t = dht.readTemperature(); // Celsius by default
-
-    if (isnan(h) || isnan(t)) {
-      dhtReadingValid = false;
-      Serial.println("DHT11 read failed (NaN); will retry next interval");
+    if (!readDht()) {
+      Serial.println("DHT11 read failed on GPIO4 and GPIO3; will retry next interval");
     } else {
-      dhtTempC = t;
-      dhtHumidity = h;
-      dhtReadingValid = true;
       Serial.printf("DHT11: Temp=%.1f C, Humidity=%.1f %%\n", dhtTempC, dhtHumidity);
     }
   }
@@ -429,6 +494,19 @@ void loop() {
     display.drawString(0, 0, mlxReadingValid ? "IR object: " + String(mlxObjectC, 1) + " C"
                                            : "HW-691: no reading");
     if (mlxReadingValid) display.drawString(0, 12, "IR ambient: " + String(mlxAmbientC, 1) + " C");
+  }
+
+  if (svmConnected && millis() - lastSvmRead >= 1000) {
+    lastSvmRead = millis();
+    readSvm();
+  }
+  if (svmConnected && (millis() / 3000) % 2) {
+    display.setColor(BLACK);
+    display.fillRect(0, 24, 128, 22);
+    display.setColor(WHITE);
+    display.drawString(0, 24, svmReadingValid ? "VOC " + String(svmVoc, 1) + " NOx " + String(svmNox, 1)
+                                           : "SVM41: no reading");
+    if (svmReadingValid) display.drawString(0, 34, "SVM " + String(svmTempC, 1) + "C " + String(svmHumidity, 1) + "%");
   }
 
   if (millis() - lastFireCheck >= FIRE_CHECK_INTERVAL_MS) {
