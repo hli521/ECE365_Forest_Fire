@@ -55,3 +55,10 @@ Run these commands from the project root, with `test_hybrid.cpp` located there.
 - The **Server** receives sensor readings and fire detection results through LoRa.
 - The existing FFS5 packet format remains unchanged.
 - Detection thresholds are experimental and require calibration before real-world deployment.
+
+## Fire Detection Files
+
+| File | Description |
+|---|---|
+| `fire_detection.h` | Defines shared sensor data structures, fire alert levels, and detection reason codes. |
+| `hybrid_fire_detection.h` | Implements the hybrid fire detection algorithm, including absolute thresholds, sliding window-based anomaly detection, humidity reliability checks, and fire alert decision logic. |
