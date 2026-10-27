@@ -410,7 +410,7 @@ void loop() {
         Serial.print(i % 8 == 7 ? '\n' : '\t');
       }
 
-      if (t == -99.0f) continue; // per-pixel read error, skip it
+      if (t == -99.0f || t < -20.0f || t > 100.0f) continue; // per-pixel read error, skip it
       minTemp = min(minTemp, t);
       maxTemp = max(maxTemp, t);
       sumTemp += t;
