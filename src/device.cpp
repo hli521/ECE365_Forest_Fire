@@ -14,6 +14,7 @@
 #include <Adafruit_Sensor.h>  // Adafruit Unified Sensor (DHT library dependency)
 #include <stdint.h>
 #include "fire_detection.h"
+#include "hybrid_fire_detection.h"
 #include "sensor_packet.h"
 
 // Grid-EYE default I2C address is 0x69 (jumper open).
@@ -113,7 +114,7 @@ uint8_t sensorsPresent = 0;
 constexpr unsigned long FIRE_CHECK_INTERVAL_MS = 1000;
 unsigned long lastFireCheck = 0;
 float gridMaxTempC = NAN;
-fire::Detector fireDetector;
+hybrid_fire::Detector<> hybridDetector;
 fire::Level fireLevel = fire::Level::Normal;
 uint8_t fireReasons = 0;
 
@@ -240,9 +241,9 @@ void checkForFire() {
   }
   if (airReadingValid) readings.pm25 = airData.pm25_env;
 
-  fire::Assessment assessment = fire::assess(readings);
+  hybrid_fire::Result assessment = hybridDetector.update(readings);
   fire::Level previous = fireLevel;
-  fireLevel = fireDetector.update(assessment.level);
+  fireLevel = assessment.level;
   fireReasons = assessment.reasons;
 
   char reasonText[64];
@@ -250,6 +251,9 @@ void checkForFire() {
   Serial.printf("Fire check: %s (current reading %s; max temp %.1f C, RH %.1f %%, PM2.5 %.0f ug/m3, VOC %.1f, NOx %.1f; reasons: %s)\n",
                 fire::levelName(fireLevel), fire::levelName(assessment.level),
                 readings.maxTempC, readings.humidityPct, readings.pm25, readings.vocIndex, readings.noxIndex, reasonText);
+  Serial.printf("Hybrid: %s (T=%d, PM=%d, baselineT=%.1f, baselinePM=%.1f)\n",
+                hybrid_fire::modeName(assessment.mode), assessment.temperatureAnomaly,
+                assessment.pmAnomaly, assessment.temperatureBaseline, assessment.pmBaseline);
   if (fireLevel != previous) {
     Serial.printf("*** FIRE LEVEL CHANGED: %s -> %s ***\n",
                   fire::levelName(previous), fire::levelName(fireLevel));
